@@ -21,6 +21,11 @@ Java Validator가 반환한 소스(Oracle)/타겟(PostgreSQL) 실행 결과를 �
   - ResultComparator.compare(): 성공/행수/컬럼/값 비교, 실패유형·심각도 분류
 2026-07-27 | OMA Team | tolerance 제거 - 완전 일치 원칙
   - 숫자 근사 비교/공백 strip 제거. int/float 정확 동치만 허용
+2026-07-29 | Claude | 실행 시간 수집 (튜닝 후보 식별용)
+  - Comparison에 source_time_ms/target_time_ms 추가
+  - compare()에서 Java executionTimeMs를 _stamp_timing으로 모든 경로에 기록
+  - 원인: 검증기가 시간을 측정하나 파이썬 단계에서 버려져 성능 격차 분석 불가
+  - 주의: 정합성 파일(to_dict/validation-details.json) 스키마는 미변경. 성능 전용 리포트에서만 소비
 """
 
 import logging
@@ -56,6 +61,10 @@ class Comparison:
     values_matched: bool = True
     source_rows: int = 0
     target_rows: int = 0
+    # 소스/타겟 SQL 실행 시간(ms). Java DatabaseExecutor가 측정한 executionTimeMs.
+    # 단발성 측정이라 정밀 벤치마크가 아닌 튜닝 후보 식별용 티핑 포인트 지표로만 사용.
+    source_time_ms: Optional[int] = None
+    target_time_ms: Optional[int] = None
     differences: List[Dict[str, Any]] = field(default_factory=list)
     value_differences: List[Dict[str, Any]] = field(default_factory=list)
     note: Optional[str] = None
@@ -95,22 +104,25 @@ class ResultComparator:
 
         # 스킵(프로시저 등): 양쪽 다 스킵이면 skipped
         if source.get("skipped") or target.get("skipped"):
-            return Comparison(
+            comp = Comparison(
                 tc_id=tc_id, status=STATUS_SKIPPED, matched=False,
                 note=source.get("skipReason") or target.get("skipReason"),
             )
-
         # 실행 성공 여부
-        if not source.get("success") or not target.get("success"):
-            return Comparison(
+        elif not source.get("success") or not target.get("success"):
+            comp = Comparison(
                 tc_id=tc_id, status=STATUS_FAILED,
                 failure_type=FAIL_EXECUTION_ERROR, severity="high", matched=False,
                 source_rows=source.get("rowCount", 0),
                 target_rows=target.get("rowCount", 0),
                 note=self._exec_error_note(source, target),
             )
+        else:
+            comp = self._compare_success(tc_id, source, target)
 
-        return self._compare_success(tc_id, source, target)
+        # 실행 시간 스탬프 (튜닝 후보 식별용). 실패/스킵이어도 실행된 쪽 시간은 기록.
+        self._stamp_timing(comp, source, target)
+        return comp
 
     def _compare_success(
         self, tc_id: str, source: Dict[str, Any], target: Dict[str, Any]
@@ -240,6 +252,19 @@ class ResultComparator:
         if isinstance(value, (int, float)):
             return float(value)
         return None
+
+    @staticmethod
+    def _stamp_timing(
+        comp: Comparison, source: Dict[str, Any], target: Dict[str, Any]
+    ) -> None:
+        """
+        Java 실행 결과의 executionTimeMs를 Comparison에 기록한다.
+
+        정합성 판정과 무관한 성능 지표이므로 성능 전용 리포트에서만 소비한다
+        (validation-details.json 스키마에는 포함하지 않음).
+        """
+        comp.source_time_ms = source.get("executionTimeMs")
+        comp.target_time_ms = target.get("executionTimeMs")
 
     @staticmethod
     def _exec_error_note(source: Dict[str, Any], target: Dict[str, Any]) -> str:

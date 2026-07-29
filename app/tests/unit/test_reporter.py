@@ -103,3 +103,63 @@ def test_empty_comparisons(reporter):
     s = reporter.build_summary([])
     assert s["total_test_cases"] == 0
     assert s["success_rate"] == 0.0
+
+
+# --- 성능 시간 리포트 --------------------------------------------------------
+
+def _perf_comps():
+    """소스/타겟 시간이 있는 TC들 (일부는 시간 없음)."""
+    return [
+        Comparison(tc_id="t1", status=STATUS_PASSED, matched=True,
+                   source_time_ms=10, target_time_ms=110),   # gap 100
+        Comparison(tc_id="t2", status=STATUS_PASSED, matched=True,
+                   source_time_ms=50, target_time_ms=60),     # gap 10
+        Comparison(tc_id="t3", status=STATUS_PASSED, matched=True,
+                   source_time_ms=200, target_time_ms=100),   # gap -100 (타겟이 빠름)
+        Comparison(tc_id="t4", status=STATUS_SKIPPED, note="proc"),  # 시간 없음 → 제외
+    ]
+
+
+def _perf_meta():
+    return {
+        "t1": {"sql_id": "selectA", "namespace": "ns.A", "mapper": "AMapper"},
+        "t2": {"sql_id": "selectB", "namespace": "ns.B", "mapper": "BMapper"},
+        "t3": {"sql_id": "selectC", "namespace": "ns.C", "mapper": "CMapper"},
+    }
+
+
+def test_perf_rows_sorted_by_gap_desc(reporter):
+    """gap_ms 내림차순 정렬, 시간 없는 TC는 제외"""
+    rows = reporter.build_perf_rows(_perf_comps(), _perf_meta())
+    assert [r["tc_id"] for r in rows] == ["t1", "t2", "t3"]
+    assert rows[0]["gap_ms"] == 100
+    assert rows[-1]["gap_ms"] == -100
+
+
+def test_perf_rows_use_sql_id_from_meta(reporter):
+    """sql_id는 tc_meta에서 가져옴 (tc_id 파싱 안 함)"""
+    rows = reporter.build_perf_rows(_perf_comps(), _perf_meta())
+    assert rows[0]["sql_id"] == "selectA"
+    assert rows[0]["ratio"] == 11.0  # 110/10
+
+
+def test_perf_ratio_null_when_source_zero(reporter):
+    """source 0ms면 ratio는 None (0 나눗셈 회피)"""
+    comps = [Comparison(tc_id="z", status=STATUS_PASSED, matched=True,
+                        source_time_ms=0, target_time_ms=5)]
+    rows = reporter.build_perf_rows(comps, {})
+    assert rows[0]["ratio"] is None
+    assert rows[0]["gap_ms"] == 5
+    # meta 없으면 sql_id는 tc_id로 폴백
+    assert rows[0]["sql_id"] == "z"
+
+
+def test_perf_report_files_created(reporter, tmp_path):
+    """performance-timings.csv/json 생성"""
+    reporter.generate_all_reports(_perf_comps(), _perf_meta())
+    rdir = tmp_path / "reports"
+    assert (rdir / "performance-timings.json").exists()
+    assert (rdir / "performance-timings.csv").exists()
+    data = json.loads((rdir / "performance-timings.json").read_text())
+    assert len(data["timings"]) == 3
+    assert data["timings"][0]["tc_id"] == "t1"

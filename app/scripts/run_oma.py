@@ -11,6 +11,8 @@ OMA 메인 실행 스크립트 (CLI 진입점)
   python3.11 scripts/run_oma.py --phase dictionary        # 특정 Phase만
   python3.11 scripts/run_oma.py --phase convert,merge     # 여러 Phase
   python3.11 scripts/run_oma.py --config custom.properties
+  python3.11 scripts/run_oma.py --reconvert selTdrSeqno   # 검증 후 특정 쿼리만 재변환
+  python3.11 scripts/run_oma.py --reconvert-all           # 검증 후 전체 재변환
 
 Phase 별칭: preflight/dictionary/copy/fragment/convert/merge/validate/copy_target/all
 
@@ -18,6 +20,10 @@ Phase 별칭: preflight/dictionary/copy/fragment/convert/merge/validate/copy_tar
 2026-07-27 | OMA Team | 초기 생성
   - argparse CLI, config 로드, 협력자 지연 조립, --preflight/--phase 실행
   - 실행 협력자는 실제 필요한 Phase에서만 생성 (DB/Bedrock 불필요 Phase는 스킵)
+2026-07-29 | Claude | --reconvert / --reconvert-all 추가 (검증 후 재변환)
+  - 조각 진행+Phase(4~6)를 함께 되돌려 convert→merge→validate 재실행
+  - _rewind_for_reconvert: sql_id 선택 또는 전체 조각 되돌림 후 phase 재오픈
+  - 원인: 검증까지 끝난 뒤 재변환 필요 시 두 겹(phase+조각)의 스킵을 열어야 함
 """
 
 import argparse
@@ -201,6 +207,15 @@ def main(argv=None) -> int:
         "--retry-failed", action="store_true",
         help="체크포인트의 실패 조각만 재시도 (Phase4)",
     )
+    parser.add_argument(
+        "--reconvert", metavar="SQL_ID",
+        help="검증 후 재변환: 지정 sql_id 조각만 되돌려 Phase4(변환)부터 재실행 "
+             "(콤마 구분 다중 지정 가능). Phase4/5/6를 다시 연다",
+    )
+    parser.add_argument(
+        "--reconvert-all", action="store_true",
+        help="검증 후 재변환: 모든 조각을 되돌려 Phase4(변환)부터 전체 재실행",
+    )
     args = parser.parse_args(argv)
 
     if not os.path.isfile(args.config):
@@ -226,6 +241,20 @@ def main(argv=None) -> int:
         )
         return 0
 
+    if args.reconvert and args.reconvert_all:
+        print("[ERROR] --reconvert 와 --reconvert-all 은 함께 쓸 수 없습니다",
+              file=sys.stderr)
+        return 1
+
+    # --reconvert / --reconvert-all: 변환~검증 Phase를 되돌린 뒤 convert부터 재실행
+    if args.reconvert or args.reconvert_all:
+        phases = [PHASE_CONVERSION, PHASE_MERGE, PHASE_VALIDATION]
+        orch = build_orchestrator(config, phases)
+        _rewind_for_reconvert(orch, args)
+        orch.run(phases=phases)
+        logger.info("OMA 재변환 실행 완료")
+        return 0
+
     try:
         phases = parse_phases(args.phase)
     except ValueError as e:
@@ -241,6 +270,34 @@ def main(argv=None) -> int:
     orch.run(phases=phases)
     logger.info("OMA 실행 완료")
     return 0
+
+
+def _rewind_for_reconvert(orch: WorkflowOrchestrator, args) -> None:
+    """
+    재변환을 위해 체크포인트를 되돌린다 (조각 진행 + Phase progress).
+
+    Phase progress만 열면 조각이 완료 상태로 남아 변환이 건너뛰어지므로,
+    조각 진행과 Phase(4~6)를 함께 되돌려야 실제로 다시 변환된다.
+
+    Args:
+        orch: 오케스트레이터 (checkpoint 포함)
+        args: 파싱된 CLI 인자 (reconvert / reconvert_all)
+    """
+    cp = orch.checkpoint
+    if args.reconvert_all:
+        prev = cp.reset_all_fragments()
+        logger.info("전체 재변환: 조각 %d개 되돌림", prev)
+    else:
+        sql_ids = [s.strip() for s in args.reconvert.split(",") if s.strip()]
+        removed = cp.reset_fragments_by_sql_id(sql_ids)
+        if not removed:
+            logger.warning(
+                "일치하는 완료 조각이 없습니다 (sql_id=%s). Phase는 그대로 다시 실행됩니다.",
+                sql_ids,
+            )
+        else:
+            logger.info("선택 재변환: 조각 %d개 되돌림 %s", len(removed), removed)
+    cp.reopen_phases_from(PHASE_CONVERSION)
 
 
 if __name__ == "__main__":

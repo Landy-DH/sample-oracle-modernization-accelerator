@@ -14,6 +14,9 @@
 2026-07-27 | OMA Team | 초기 생성
   - ValidationOrchestrator.validate_all: TC 로드→검증→비교→리포트
   - load_test_cases(디렉토리 순회), run_id 생성은 호출측 주입
+2026-07-29 | Claude | 성능 리포트용 tc_meta 매핑 주입
+  - _build_tc_meta: tc_id -> {sql_id,namespace,mapper} (tc_id 파싱 회피)
+  - generate_all_reports에 tc_meta 전달 → sql_id별 시간 격차 집계
 """
 
 import json
@@ -74,6 +77,9 @@ class ValidationOrchestrator:
 
         logger.info("검증 시작: TC %d개", len(test_cases))
 
+        # 성능 리포트에서 tc_id를 sql_id로 그룹핑하기 위한 메타 매핑 (tc 파싱 없이 원본 사용)
+        tc_meta = self._build_tc_meta(test_cases)
+
         # 1) Java 검증 (배치)
         java_results = self.bridge.validate_batch(test_cases)
 
@@ -81,8 +87,34 @@ class ValidationOrchestrator:
         comparisons = [self.comparator.compare(r) for r in java_results]
 
         # 3) 리포트 생성
-        summary = self.reporter.generate_all_reports(comparisons)
+        summary = self.reporter.generate_all_reports(comparisons, tc_meta)
         return summary
+
+    @staticmethod
+    def _build_tc_meta(test_cases: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
+        """
+        TC 리스트에서 tc_id -> {sql_id, namespace, mapper} 매핑을 만든다.
+
+        성능 리포트가 tc_id를 sql_id로 집계할 때 tc_id 문자열을 파싱하지 않고
+        원본 TC 필드를 그대로 쓰기 위함 (mapper/sql_id에 언더스코어가 섞여 파싱 불가).
+
+        Args:
+            test_cases: TC dict 리스트
+
+        Returns:
+            tc_id -> 메타 dict
+        """
+        meta: Dict[str, Dict[str, str]] = {}
+        for tc in test_cases:
+            tc_id = tc.get("test_case_id")
+            if not tc_id:
+                continue
+            meta[tc_id] = {
+                "sql_id": tc.get("sql_id", ""),
+                "namespace": tc.get("namespace", ""),
+                "mapper": tc.get("mapper", ""),
+            }
+        return meta
 
     def load_test_cases(self, testcase_dir: str) -> List[Dict[str, Any]]:
         """

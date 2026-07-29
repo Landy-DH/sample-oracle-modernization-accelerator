@@ -4,6 +4,7 @@ run_oma CLI 단위 테스트 (협력자 조립/phase 파싱, DB/LLM 없이)
 변경 이력:
 2026-07-27 | OMA Team | 초기 생성
   - parse_phases, build_orchestrator 지연 조립, --preflight, 인자 검증
+2026-07-29 | Claude | --reconvert 되돌리기 로직/상호배타 테스트 추가
 """
 
 import importlib.util
@@ -112,6 +113,64 @@ def test_main_invalid_phase(tmp_path):
     prop = tmp_path / "p.properties"
     prop.write_text("APPLICATION_NAME=wms\n", encoding="utf-8")
     assert run_oma.main(["--config", str(prop), "--phase", "bogus"]) == 1
+
+
+def test_main_reconvert_mutually_exclusive(tmp_path):
+    """--reconvert 와 --reconvert-all 동시 사용 → 종료코드 1"""
+    prop = tmp_path / "p.properties"
+    prop.write_text("APPLICATION_NAME=wms\n", encoding="utf-8")
+    rc = run_oma.main([
+        "--config", str(prop), "--reconvert", "foo", "--reconvert-all",
+    ])
+    assert rc == 1
+
+
+class _FakeCheckpoint:
+    """되돌리기 호출을 기록하는 가짜 체크포인트."""
+
+    def __init__(self):
+        self.calls = []
+
+    def reset_all_fragments(self):
+        self.calls.append(("reset_all", None))
+        return 5
+
+    def reset_fragments_by_sql_id(self, sql_ids):
+        self.calls.append(("reset_sql", sql_ids))
+        return [f"M__select__{s}" for s in sql_ids]
+
+    def reopen_phases_from(self, phase):
+        self.calls.append(("reopen", phase))
+        return [phase]
+
+
+class _FakeOrch:
+    def __init__(self):
+        self.checkpoint = _FakeCheckpoint()
+
+
+class _Args:
+    def __init__(self, reconvert=None, reconvert_all=False):
+        self.reconvert = reconvert
+        self.reconvert_all = reconvert_all
+
+
+def test_rewind_reconvert_all_calls_reset_all():
+    """--reconvert-all → 전체 조각 초기화 + phase4 재오픈"""
+    orch = _FakeOrch()
+    run_oma._rewind_for_reconvert(orch, _Args(reconvert_all=True))
+    calls = orch.checkpoint.calls
+    assert ("reset_all", None) in calls
+    assert ("reopen", PHASE_CONVERSION) in calls
+
+
+def test_rewind_reconvert_selective_splits_sql_ids():
+    """--reconvert 콤마 분리 후 sql_id별 되돌림 + phase4 재오픈"""
+    orch = _FakeOrch()
+    run_oma._rewind_for_reconvert(orch, _Args(reconvert="foo, bar"))
+    calls = orch.checkpoint.calls
+    assert ("reset_sql", ["foo", "bar"]) in calls
+    assert ("reopen", PHASE_CONVERSION) in calls
 
 
 def test_main_preflight(tmp_path, monkeypatch):

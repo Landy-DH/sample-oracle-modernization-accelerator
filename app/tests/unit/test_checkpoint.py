@@ -4,6 +4,8 @@ CheckpointManager 단위 테스트
 변경 이력:
 2026-07-27 | OMA Team | 초기 생성
   - phase/fragment 진행, 재시작 로드, 실패 추적, 원자적 저장 테스트
+2026-07-29 | Claude | 부분 되돌리기(rewind) 테스트 추가
+  - reopen_phases_from / reset_fragments_by_sql_id(접미사 정확 매칭) / reset_all_fragments
 """
 
 import json
@@ -165,3 +167,73 @@ def test_reset(cp):
     cp.reset()
     assert cp.is_fresh_run() is True
     assert cp.get_pending_fragments(["a"]) == ["a"]
+
+
+# --- 부분 되돌리기(rewind) ---------------------------------------------------
+
+def _complete_all_phases(cp):
+    for p in PHASES:
+        cp.mark_phase_completed(p)
+
+
+def test_reopen_phases_from_conversion(cp):
+    """phase4부터 끝까지 pending, 이전 phase는 유지"""
+    _complete_all_phases(cp)
+    reopened = cp.reopen_phases_from("phase4_conversion")
+    assert reopened == PHASES[3:]
+    # phase1~3은 여전히 완료
+    assert cp.is_completed("phase3_fragment") is True
+    # phase4~7은 되돌려짐
+    assert cp.is_completed("phase4_conversion") is False
+    assert cp.is_completed("phase6_validation") is False
+    assert cp.current_phase() == "phase4_conversion"
+
+
+def test_reset_fragments_by_sql_id_exact_suffix(cp):
+    """'__sql_id' 접미사 정확 매칭 — 부분일치 오염 없음"""
+    cp.mark_fragment_completed("AMapper__select__selTdrSeqno")
+    cp.mark_fragment_completed("BMapper__select__selTdrSeqnoDetail")  # 다른 sql_id
+    cp.mark_fragment_completed("CMapper__resultMap__selTdrSeqno")     # 같은 sql_id, 다른 type
+    removed = cp.reset_fragments_by_sql_id(["selTdrSeqno"])
+    assert set(removed) == {"AMapper__select__selTdrSeqno",
+                            "CMapper__resultMap__selTdrSeqno"}
+    # selTdrSeqnoDetail은 건드리지 않음 (부분일치 방지)
+    assert cp.is_fragment_completed("BMapper__select__selTdrSeqnoDetail") is True
+    assert cp.is_fragment_completed("AMapper__select__selTdrSeqno") is False
+
+
+def test_reset_fragments_by_sql_id_none_matched(cp):
+    """일치 조각 없으면 빈 리스트, 상태 불변"""
+    cp.mark_fragment_completed("AMapper__select__foo")
+    removed = cp.reset_fragments_by_sql_id(["nonexistent"])
+    assert removed == []
+    assert cp.is_fragment_completed("AMapper__select__foo") is True
+
+
+def test_reset_fragments_clears_failure(cp):
+    """되돌린 조각의 실패 기록도 정리"""
+    cp.mark_fragment_completed("AMapper__select__foo")
+    cp.mark_fragment_failed("AMapper__select__foo", "boom", retry_count=1)
+    cp.reset_fragments_by_sql_id(["foo"])
+    assert cp.get_retryable_failures() == []
+
+
+def test_reset_all_fragments(cp):
+    """전체 조각 진행 초기화"""
+    cp.mark_fragment_completed("a")
+    cp.mark_fragment_completed("b")
+    prev = cp.reset_all_fragments()
+    assert prev == 2
+    assert cp.get_pending_fragments(["a", "b"]) == ["a", "b"]
+
+
+def test_rewind_persists_to_disk(cp, cp_path):
+    """되돌리기 결과가 디스크에 반영됨"""
+    _complete_all_phases(cp)
+    cp.mark_fragment_completed("AMapper__select__foo")
+    cp.reset_fragments_by_sql_id(["foo"])
+    cp.reopen_phases_from("phase4_conversion")
+    with open(cp_path, encoding="utf-8") as f:
+        data = json.load(f)
+    assert data["progress"]["phase4_conversion"] == STATUS_PENDING
+    assert "AMapper__select__foo" not in data["phase4_detail"]["completed_fragments"]

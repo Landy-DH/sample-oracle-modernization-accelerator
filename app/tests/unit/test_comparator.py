@@ -171,3 +171,29 @@ def test_to_dict_serializable(cmp):
     import json
     c = cmp.compare(_vr(_select([{"id": 1}]), _select([{"id": 1}])))
     json.dumps(ResultComparator.to_dict(c))
+
+
+def test_timing_stamped_on_success(cmp):
+    """성공 경로에서 executionTimeMs가 Comparison에 기록됨"""
+    src = _select([{"id": 1}]); src["executionTimeMs"] = 12
+    tgt = _select([{"id": 1}]); tgt["executionTimeMs"] = 34
+    c = cmp.compare(_vr(src, tgt))
+    assert c.source_time_ms == 12
+    assert c.target_time_ms == 34
+
+
+def test_timing_stamped_on_error(cmp):
+    """실행 실패 경로에서도 실행된 쪽 시간은 기록"""
+    ok = _select([{"id": 1}]); ok["executionTimeMs"] = 5
+    fail = {"success": False, "skipped": False, "errorMessage": "boom",
+            "rowCount": 0, "rows": [], "columns": [], "executionTimeMs": 99}
+    c = cmp.compare(_vr(ok, fail))
+    assert c.source_time_ms == 5
+    assert c.target_time_ms == 99
+
+
+def test_timing_absent_when_not_provided(cmp):
+    """시간 필드 없으면 None (성능 리포트에서 제외됨)"""
+    c = cmp.compare(_vr(_select([{"id": 1}]), _select([{"id": 1}])))
+    assert c.source_time_ms is None
+    assert c.target_time_ms is None

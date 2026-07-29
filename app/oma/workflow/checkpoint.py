@@ -12,6 +12,11 @@
   - CheckpointManager: phase/fragment 진행 저장, 재시작, 실패 추적
   - 원자적 저장(tmp+os.replace), 완료 조각은 set으로 관리(대규모 조회 성능)
   - 시간 함수 주입 가능(테스트), datetime timezone-aware 사용
+2026-07-29 | Claude | 부분 되돌리기(rewind) 지원 (재변환용)
+  - reopen_phases_from: 지정 Phase~끝을 pending으로 (검증 후 재변환 진입)
+  - reset_fragments_by_sql_id: sql_id 조각만 미완료로 (선택 재변환), '__sql_id' 접미사 정확 매칭
+  - reset_all_fragments: 전체 조각 진행 초기화 (전체 재변환)
+  - 원인: 검증까지 끝난 뒤 재변환 필요 시 phase+조각 두 겹의 스킵을 함께 열어야 함
 """
 
 import json
@@ -227,6 +232,89 @@ class CheckpointManager:
         self.checkpoint = self._create_new()
         self._completed_set = set()
         self.save()
+
+    # ------------------------------------------------------- 부분 되돌리기(rewind)
+
+    def reopen_phases_from(self, phase: str) -> List[str]:
+        """
+        지정 Phase와 그 이후 모든 Phase를 pending으로 되돌린다 (재실행 대상).
+
+        검증까지 끝난 뒤 재변환이 필요할 때, phase4부터 다시 실행되도록 progress를
+        연다. current phase도 되돌린 첫 Phase로 옮긴다. 조각 단위 완료는 건드리지
+        않으므로, 변환을 실제로 다시 돌리려면 reset_fragments_*도 함께 호출해야 한다.
+
+        Args:
+            phase: 되돌리기 시작 Phase (이 Phase부터 끝까지 pending)
+
+        Returns:
+            pending으로 되돌린 Phase 이름 리스트
+        """
+        self._validate_phase(phase)
+        start = PHASES.index(phase)
+        reopened = PHASES[start:]
+        for p in reopened:
+            self.checkpoint["progress"][p] = STATUS_PENDING
+        self.checkpoint["phase"] = phase
+        self.save()
+        logger.info("Phase 되돌림(pending): %s", reopened)
+        return reopened
+
+    def reset_fragments_by_sql_id(self, sql_ids: List[str]) -> List[str]:
+        """
+        주어진 sql_id에 해당하는 완료 조각을 미완료로 되돌린다 (선택 재변환).
+
+        조각 식별자는 '<mapper>__<type>__<sql_id>' 형식이므로 구분자 '__'를 포함한
+        접미사 '__<sql_id>'로 정확히 매칭한다(부분일치 오염 방지). 정규식은 쓰지 않는다.
+        실패 기록도 함께 정리해 재시도 카운트가 남지 않게 한다.
+
+        Args:
+            sql_ids: 되돌릴 sql_id 목록
+
+        Returns:
+            실제로 되돌린 조각 식별자 리스트
+        """
+        suffixes = [f"__{sid}" for sid in sql_ids]
+        detail = self.checkpoint["phase4_detail"]
+        removed = [
+            fid for fid in detail["completed_fragments"]
+            if any(fid.endswith(sfx) for sfx in suffixes)
+        ]
+        if not removed:
+            logger.warning("되돌릴 완료 조각 없음 (sql_id=%s)", sql_ids)
+            return []
+
+        removed_set = set(removed)
+        detail["completed_fragments"] = [
+            fid for fid in detail["completed_fragments"] if fid not in removed_set
+        ]
+        detail["completed"] = len(detail["completed_fragments"])
+        detail["failed_fragments"] = [
+            f for f in detail["failed_fragments"]
+            if f.get("fragment_id") not in removed_set
+        ]
+        detail["failed"] = len(detail["failed_fragments"])
+        self._completed_set -= removed_set
+        self.save()
+        logger.info("조각 되돌림: %d개 (%s)", len(removed), removed)
+        return removed
+
+    def reset_all_fragments(self) -> int:
+        """
+        모든 조각 진행(완료/실패)을 초기화한다 (전체 재변환).
+
+        Returns:
+            초기화 전 완료 조각 수
+        """
+        detail = self.checkpoint["phase4_detail"]
+        prev = len(detail["completed_fragments"])
+        detail["completed"] = 0
+        detail["failed"] = 0
+        detail["completed_fragments"] = []
+        detail["failed_fragments"] = []
+        self._completed_set = set()
+        self.save()
+        logger.info("전체 조각 진행 초기화: 이전 완료 %d개", prev)
+        return prev
 
     @staticmethod
     def _validate_phase(phase: str) -> None:
