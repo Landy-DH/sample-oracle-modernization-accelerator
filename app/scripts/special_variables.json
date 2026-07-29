@@ -1,0 +1,24 @@
+{
+  "_comment": "프레임워크가 런타임 주입하는 특수 바인드 변수. TC로 바인딩 불가하므로 원본 매퍼 복사본에서 리터럴 SQL로 선치환한다. 지금은 oracle 값으로 치환(원본이 Oracle) → 이후 LLM 변환이 postgres로 바꿈.",
+  "variables": {
+    "PAGING_ROWNUM_TOP": {
+      "oracle": "SELECT GRID_PAGING.*, 1 AS PAGING_CURRENT, 1000 AS PAGING_LIMIT FROM (",
+      "postgres": "SELECT GRID_PAGING.*, 1 AS PAGING_CURRENT, 1000 AS PAGING_LIMIT FROM ("
+    },
+    "PAGING_ROWNUM_BOTTOM": {
+      "oracle": ") GRID_PAGING WHERE ROWNUM <= 1000",
+      "postgres": ") GRID_PAGING LIMIT '1000'::int OFFSET ('1'::int - 1) * '1000'::int"
+    },
+    "sysdate": {
+      "oracle": "SYSDATE",
+      "postgres": "CURRENT_TIMESTAMP"
+    }
+  },
+
+  "_ognl_comment": "테스트용 OGNL 정적 메서드 치환. 실전에서는 고객 OGNL 클래스(com.example.*)를 classpath에 등록하므로 이 치환을 끄고 원본 그대로 둔다. 각 메서드는 결국 빈값 여부 판별이므로 MyBatis 기본 OGNL(!= null / == null)로 단순화한다.",
+  "ognl_methods": {
+    "@com.example.util.StringUtil@isNotEmpty": " != null",
+    "@com.example.util.CommonFunction@notEmpty": " != null",
+    "@com.example.util.StringUtil@isEmpty": " == null"
+  }
+}

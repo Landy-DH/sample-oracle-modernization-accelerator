@@ -1,0 +1,32 @@
+{
+  "_comment": "소스→타겟 방언별 변환 힌트. Opus 4.8이 대부분 스스로 판단하므로 최소한의 방언 특이사항만 명시한다. 상세 함수 매핑을 나열하지 않는다(모델 신뢰). 지원 조합: oracle→postgres/mysql, epas→postgres.",
+
+  "oracle_to_postgres": {
+    "supported": true,
+    "cast_syntax": "value::TYPE (예: #{id}::INTEGER, '2024-01-01'::DATE)",
+    "notes": [
+      "Oracle 전용 함수/문법을 PostgreSQL 표준으로 변환 (NVL/DECODE/ROWNUM/DUAL/(+)/SYSDATE 등)",
+      "숫자/날짜 바인드·리터럴에 명시적 캐스팅 필수. 문자열은 캐스팅 불필요"
+    ]
+  },
+
+  "oracle_to_mysql": {
+    "supported": true,
+    "cast_syntax": "CAST(value AS TYPE) (MySQL은 :: 문법 없음. 숫자=SIGNED/DECIMAL, 날짜=DATETIME)",
+    "notes": [
+      "STUB: 실데이터 검증 전. Oracle 전용 문법을 MySQL로 변환하되 세부 규칙은 미검증",
+      "MySQL은 시퀀스/일부 분석함수 미지원 - 해당 시 warning"
+    ]
+  },
+
+  "epas_to_postgres": {
+    "supported": true,
+    "cast_syntax": "value::TYPE (예: #{id}::INTEGER, '2024-01-01'::DATE)",
+    "notes": [
+      "EPAS(EDB)와 Aurora PostgreSQL 모두 PG 계열이라 대부분 문법이 이미 호환 → 최소 변환 원칙(불필요한 캐스팅/재작성 금지)",
+      "EPAS Oracle 호환 함수만 PG 표준으로 정규화: NVL→COALESCE, DECODE→CASE, SYSDATE→CURRENT_TIMESTAMP, ROWNUM→LIMIT, DUAL 제거, (+) 외부조인→LEFT/RIGHT JOIN",
+      "숫자/날짜 바인드·리터럴이 text로 비교되어 타입 불일치 시에만 명시적 캐스팅. 이미 호환되는 표현은 그대로 보존",
+      "EPAS 전용 패키지(DBMS_*)/확장/커스텀 타입 사용 시 warning(manual_review_required)"
+    ]
+  }
+}
