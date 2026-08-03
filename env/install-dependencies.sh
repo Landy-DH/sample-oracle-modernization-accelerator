@@ -81,7 +81,6 @@ if [ "$OS" = "amzn" ] || [ "$OS" = "rhel" ] || [ "$OS" = "centos" ]; then
         maven \
         git \
         wget \
-        curl \
         unzip \
         jq \
         tree \
