@@ -1,22 +1,49 @@
 #!/usr/bin/env python3
 """
-OMA Schema - Simplified Migration Pipeline
+OMA Schema - 변환/이전 파이프라인 CLI(엔트리포인트)
 
-Simple, procedural, agent-minimal approach:
-1. DMS SC Auto-Conversion (95%)
-2. Manual Object Conversion (5% - Agent-based)
-3. Drop Constraints
-4. DMS Full Load
-5. Recreate Constraints
+작업 플로우:
+  env 에서 oma 환경 배포 → DMS SC 프로젝트 생성 (선행, env 단계)
+  → [1차] DMS SC 변환 + S3 산출 + apply changes(타겟 반영)
+  → [2차] 산출물 다운로드 → 시퀀스 동기화 → 판별 → LLM 변환
+  → [3차] FK 드랍 → DMS full-load 데이터 이전 → FK 재생성
+
+이 파일은 인자 파싱/분기/보고만 담당하고, 실제 단계 로직은 pipeline.py 에 있다.
+env/oma.properties는 사용하지 않는다(모두 시크릿 기반).
+자격증명은 Secrets Manager 시크릿 "이름"으로만 참조한다.
+
+변경 이력:
+2026-08-05 | OMA Team | 전면 재작성(v2)
+  - 시크릿 기반, 모듈형 DB 접속, DMS SC 1차 변환 + S3 압축 업로드로 재설계
+  - 기존 5단계 파이프라인(제약 drop/full load 등)은 schema/bak 로 백업
+2026-08-05 | OMA Team | 2차 파이프라인 추가(--phase2)
+  - fetch → ddl_apply → sequence_sync → triage → llm_convert 오케스트레이션
+2026-08-05 | OMA Team | 3차 파이프라인 추가(--phase3, DMS full-load 데이터 이전)
+  - FK 캡처/드랍 → full-load replication task → FK 재생성 오케스트레이션
+  - full-load 는 자식 테이블 선적재 시 FK 위반으로 실패하므로 FK 선드랍 필요
+2026-08-05 | OMA Team | main.py 분리(500 line 초과) + 3차 preflight
+  - 파이프라인 실행 함수를 pipeline.py 로 이관, main 은 CLI 만 담당
+  - --phase3-preflight: 적재 전 엔드포인트 상태/접속 확인(사용자 승인용)
 """
 
-import json
+import argparse
 import logging
 import os
 import sys
 
-# Add parent directory to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+# schema 디렉토리를 import 경로에 추가(config/db/steps/pipeline 접근)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import pipeline  # noqa: E402
+import pipeline_phase3  # noqa: E402
+from config import Config, ConfigError  # noqa: E402
+from steps.artifact_fetch import ArtifactFetchError  # noqa: E402
+from steps.dms_full_load import DmsFullLoadError  # noqa: E402
+from steps.dms_sc_convert import DmsScError  # noqa: E402
+from steps.fk_manager import ForeignKeyManagerError  # noqa: E402
+from steps.s3_export import S3ExportError  # noqa: E402
+from steps.sequence_sync import SequenceSyncError  # noqa: E402
+from steps.triage import TriageError  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,346 +52,213 @@ logging.basicConfig(
 logger = logging.getLogger("oma.schema")
 
 
-def load_environment():
-    """Load environment from oma.properties and oma_env_oma.sh."""
-    logger.info("Loading environment...")
+def build_config(config_file, application_name) -> Config:
+    """
+    설정을 로드한다.
 
-    # Load oma.properties
-    oma_root = os.path.join(os.path.dirname(__file__), '..')
-    properties_file = os.path.join(oma_root, 'env', 'oma.properties')
+    Args:
+        config_file: oma.properties 경로(None이면 기본)
+        application_name: 프로젝트 섹션(None이면 파일 값)
 
-    if os.path.exists(properties_file):
-        in_common_section = False
-        with open(properties_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
+    Returns:
+        Config 인스턴스
 
-                if line.startswith('['):
-                    section_name = line.strip('[]')
-                    in_common_section = (section_name == 'COMMON')
-                    continue
-
-                if in_common_section and '=' in line:
-                    key, value = line.split('=', 1)
-                    key = key.strip()
-                    value = value.strip()
-
-                    if '${OMA_BASE_DIR}' in value:
-                        oma_base = os.path.abspath(oma_root)
-                        value = value.replace('${OMA_BASE_DIR}', oma_base)
-
-                    if key and not os.environ.get(key):
-                        os.environ[key] = value
-
-    # Load oma_env_oma.sh
-    env_script = os.path.join(oma_root, 'env', 'oma_env_oma.sh')
-
-    if os.path.exists(env_script):
-        with open(env_script, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-
-                if line.startswith('export ') and '=' in line:
-                    line = line[7:]
-                    key, value = line.split('=', 1)
-                    key = key.strip()
-                    value = value.strip()
-
-                    if value.startswith('"') and value.endswith('"'):
-                        value = value[1:-1]
-                    elif value.startswith("'") and value.endswith("'"):
-                        value = value[1:-1]
-
-                    if key:
-                        os.environ[key] = value
-
-    logger.info("✓ Environment loaded")
+    Raises:
+        ConfigError: 로드 실패 시
+    """
+    cfg = Config(config_file=config_file, application_name=application_name)
+    logger.info("프로젝트: %s", cfg.application_name)
+    return cfg
 
 
-def main():
-    """Main migration pipeline."""
-    logger.info("=" * 60)
-    logger.info("OMA Schema - Simplified Migration Pipeline")
-    logger.info("=" * 60)
-
-    # Load environment
-    load_environment()
-
-    # Get configuration
-    oracle_schema = os.environ.get("ORACLE_SCHEMA", os.environ.get("ORACLE_USER", ""))
-    if not oracle_schema:
-        logger.error("ORACLE_SCHEMA not set in environment")
-        sys.exit(1)
-
-    dms_migration_project_arn = os.environ.get("DMS_MIGRATION_PROJECT_ARN")  # Optional - will auto-create
-    dms_s3_bucket = os.environ.get("DMS_SC_S3_BUCKET")
-
-    if not dms_s3_bucket:
-        logger.error("DMS_SC_S3_BUCKET not set in environment")
-        sys.exit(1)
-
-    pg_host = os.environ.get("PGHOST")
-    pg_port = int(os.environ.get("PGPORT", "5432"))
-    pg_database = os.environ.get("PGDATABASE")
-    pg_user = os.environ.get("PGUSER", "postgres")
-    pg_password = os.environ.get("PGPASSWORD")
-    pg_schema = os.environ.get("PGSCHEMA", oracle_schema.lower())
-
-    logger.info("Oracle schema: %s", oracle_schema)
-    logger.info("PostgreSQL: %s@%s/%s (schema: %s)", pg_user, pg_host, pg_database, pg_schema)
-
-    # ========================================
-    # Step 1: DMS Schema Conversion
-    # ========================================
-    from tools.dms_sc import DMSSCConverter
-
-    dms_sc = DMSSCConverter(
-        migration_project_arn=dms_migration_project_arn,
-        s3_bucket=dms_s3_bucket
+def _parse_args() -> argparse.Namespace:
+    """CLI 인자를 파싱한다."""
+    parser = argparse.ArgumentParser(
+        description="OMA Schema 변환/이전 파이프라인(1차 DMS SC / 2차 LLM / 3차 full-load)"
     )
+    parser.add_argument(
+        "--config", default=None, help="oma.properties 경로(기본: schema/oma.properties)"
+    )
+    parser.add_argument(
+        "--app", default=None, help="프로젝트 섹션명(기본: properties의 APPLICATION_NAME)"
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="설정만 로드/검증하고 실행하지 않음(통합 점검용)",
+    )
+    parser.add_argument(
+        "--phase2",
+        action="store_true",
+        help="2차 파이프라인(산출물 다운로드→시퀀스→판별→LLM 변환) 실행",
+    )
+    parser.add_argument(
+        "--apply-changes",
+        action="store_true",
+        help="이미 변환된 모델을 타겟 DB에 반영(export-to-target 단독 실행)",
+    )
+    parser.add_argument(
+        "--phase3-preflight",
+        action="store_true",
+        help="3차 사전 점검(엔드포인트 상태/접속 테스트)만 실행 - 적재/FK 변경 없음",
+    )
+    parser.add_argument(
+        "--phase3",
+        action="store_true",
+        help="3차 파이프라인(preflight→FK 드랍→DMS full-load→FK 재생성) 실행",
+    )
+    return parser.parse_args()
 
-    # Run conversion
-    conversion_result = dms_sc.run_conversion(schema=oracle_schema, timeout=600)
 
-    if not conversion_result["success"]:
-        logger.error("DMS SC conversion failed: %s", conversion_result.get("error"))
-        sys.exit(1)
+def _phase_label(args: argparse.Namespace) -> str:
+    """인자에 따른 파이프라인 라벨을 반환한다."""
+    if args.apply_changes:
+        return "apply changes(타겟 반영)"
+    if args.phase3_preflight:
+        return "3차 사전 점검(preflight)"
+    if args.phase3:
+        return "3차 full-load 데이터 이전"
+    if args.phase2:
+        return "2차 LLM 변환"
+    return "1차 변환"
 
-    # Download results (best effort - may not exist if already applied)
-    download_result = dms_sc.download_results(schema=oracle_schema)
 
-    if download_result["success"]:
-        # Parse assessment
-        assessment = dms_sc.parse_assessment(download_result.get("assessment", ""))
-    else:
-        logger.warning("Could not download S3 results (DMS SC may have applied directly to PostgreSQL)")
-        logger.info("Checking PostgreSQL for created objects...")
+def _run_check(cfg: Config, args: argparse.Namespace) -> int:
+    """설정 검증 모드(--check): 주요 키를 출력하고 종료한다."""
+    logger.info("설정 검증 모드(--check): 실행하지 않고 종료")
+    keys = [
+        "AWS_REGION",
+        "SOURCE_SCHEMA",
+        "TARGET_SCHEMA",
+        "SOURCE_SECRET_NAME",
+        "TARGET_SECRET_NAME",
+        "DMS_MIGRATION_PROJECT_ARN",
+        "DMS_SC_S3_BUCKET",
+    ]
+    if args.phase2:
+        keys += ["WORK_DIR", "BEDROCK_MODEL_ID", "BEDROCK_REGION"]
+    if args.phase3 or args.phase3_preflight:
+        keys += [
+            "TARGET_DB_TYPE",
+            "DMS_REPLICATION_INSTANCE",
+            "DMS_SOURCE_ENDPOINT",
+            "DMS_TARGET_ENDPOINT",
+            "DMS_LOWERCASE_NAMES",
+            "FULL_LOAD_TIMEOUT",
+        ]
+    for key in keys:
+        logger.info("  %s = %s", key, cfg.get(key))
+    return 0
 
-        # Check if objects exist in PostgreSQL
-        import psycopg2
+
+def _run_apply_changes(cfg: Config) -> int:
+    """apply changes(타겟 반영) 단독 실행."""
+    try:
+        apply_result = pipeline.run_apply_changes(cfg)
+    except (ConfigError, DmsScError) as e:
+        logger.error("apply changes 실패: %s", e)
+        return 1
+    logger.info("=" * 60)
+    logger.info("apply changes 완료")
+    logger.info("=" * 60)
+    logger.info("  status  : %s", apply_result["apply_status"])
+    logger.info("  schema  : %s", apply_result["target_schema"])
+    logger.info("  elapsed : %ss", apply_result["elapsed_seconds"])
+    return 0
+
+
+def _run_phase1(cfg: Config) -> int:
+    """1차 변환 파이프라인 실행 + 보고."""
+    try:
+        result = pipeline.run_pipeline(cfg)
+    except (ConfigError, DmsScError, S3ExportError) as e:
+        logger.error("파이프라인 실패: %s", e)
+        return 1
+
+    s3 = result["s3_export"]
+    ddl_zip = s3.get("ddl_zip") or {}
+    logger.info("=" * 60)
+    logger.info("1차 목표 완료")
+    logger.info("=" * 60)
+    logger.info("  DMS SC elapsed : %ss", result["dms_sc"].get("elapsed_seconds"))
+    logger.info("  산출물 prefix  : s3://%s/%s", s3.get("bucket"), s3.get("prefix"))
+    logger.info("  변환 DDL(zip)  : %s", ddl_zip.get("s3_uri", "없음"))
+    logger.info(
+        "  action-items   : %d개, 전체 객체 %d개",
+        len(s3.get("action_items", [])),
+        s3.get("object_count", 0),
+    )
+    return 0
+
+
+def _dispatch(cfg: Config, args: argparse.Namespace) -> int:
+    """인자에 따라 해당 파이프라인을 실행하고 종료 코드를 반환한다."""
+    if args.apply_changes:
+        return _run_apply_changes(cfg)
+
+    if args.phase3_preflight:
         try:
-            conn = psycopg2.connect(
-                host=pg_host, port=pg_port, database=pg_database,
-                user=pg_user, password=pg_password
-            )
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = %s", (pg_schema,))
-            table_count = cur.fetchone()[0]
-            cur.close()
-            conn.close()
+            result = pipeline_phase3.run_phase3_preflight(cfg)
+        except (ConfigError, DmsFullLoadError) as e:
+            logger.error("3차 사전 점검 실패: %s", e)
+            return 1
+        return pipeline_phase3.report_phase3_preflight(result)
 
-            logger.info("Found %d tables in PostgreSQL schema '%s'", table_count, pg_schema)
+    if args.phase2:
+        try:
+            result = pipeline.run_phase2(cfg)
+        except (
+            ConfigError,
+            ArtifactFetchError,
+            SequenceSyncError,
+            TriageError,
+        ) as e:
+            logger.error("2차 파이프라인 실패: %s", e)
+            return 1
+        return pipeline.report_phase2(result)
 
-            # Create dummy assessment
-            assessment = {
-                "total_objects": table_count,
-                "converted": table_count,
-                "failed": 0,
-                "failed_objects": []
-            }
-        except Exception as e:
-            logger.warning("Could not check PostgreSQL: %s", e)
-            assessment = {"total_objects": 0, "converted": 0, "failed": 0, "failed_objects": []}
+    if args.phase3:
+        try:
+            result = pipeline_phase3.run_phase3(cfg)
+        except (ConfigError, ForeignKeyManagerError, DmsFullLoadError) as e:
+            logger.error("3차 파이프라인 실패: %s", e)
+            return 1
+        return pipeline_phase3.report_phase3(result)
 
-    logger.info("DMS SC Summary:")
-    logger.info("  Total objects: %d", assessment["total_objects"])
-    logger.info("  Converted: %d", assessment["converted"])
-    logger.info("  Failed: %d", assessment["failed"])
+    return _run_phase1(cfg)
 
-    # Verify objects were created in PostgreSQL
-    logger.info("=" * 60)
-    logger.info("Verifying PostgreSQL objects...")
-    logger.info("=" * 60)
 
-    import psycopg2
-    conn = psycopg2.connect(
-        host=pg_host, port=pg_port, database=pg_database,
-        user=pg_user, password=pg_password
-    )
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = %s", (pg_schema,))
-    table_count = cur.fetchone()[0]
-    cur.close()
-    conn.close()
+def main() -> int:
+    """
+    엔트리포인트.
 
-    logger.info("PostgreSQL: %d tables found in schema '%s'", table_count, pg_schema)
-
-    if table_count == 0:
-        logger.error("DMS SC did not create any tables in PostgreSQL!")
-        logger.error("Check if DMS SC 'export_to_target' step succeeded")
-        sys.exit(1)
-
-    # ========================================
-    # Step 1.5: Fix Oracle PK NUMBER to NUMERIC
-    # ========================================
-    # DMS SC converts Oracle PK NUMBER → BIGINT for performance
-    # But DMS Full Load extracts Oracle NUMBER as "123.0000000000"
-    # This causes BIGINT insertion errors
-    # Fix: Oracle PK NUMBER(scale=0) → PostgreSQL NUMERIC(precision,0)
+    Returns:
+        프로세스 종료 코드(0=성공)
+    """
+    args = _parse_args()
 
     logger.info("=" * 60)
-    logger.info("Step 1.5: Fixing Oracle PK NUMBER columns")
+    logger.info("OMA Schema - %s 파이프라인", _phase_label(args))
     logger.info("=" * 60)
 
-    from tools.number_type_optimizer import NumberTypeOptimizer
+    try:
+        cfg = build_config(args.config, args.app)
+    except ConfigError as e:
+        logger.error("설정 로드 실패: %s", e)
+        return 1
 
-    target_config = {
-        'host': pg_host,
-        'port': pg_port,
-        'database': pg_database,
-        'user': pg_user,
-        'password': pg_password,
-        'schema': pg_schema,
-        'db_type': 'postgres'
-    }
+    if args.check:
+        return _run_check(cfg, args)
 
-    optimizer = NumberTypeOptimizer(oracle_schema, target_config)
-
-    # Find ALL Oracle NUMBER columns and fix PostgreSQL BIGINT/INTEGER
-    results = optimizer.fix_all_integer_number_to_numeric()
-
-    if results:
-        # Generate ALTER statements
-        alter_statements = optimizer.generate_alter_statements()
-
-        if alter_statements:
-            logger.info("Applying PK type fixes...")
-            opt_result = optimizer.apply_optimizations(alter_statements)
-            logger.info("✓ Fixed %d PK columns", opt_result["applied_count"])
-
-            if opt_result["failed"]:
-                logger.warning("Failed to fix %d columns", opt_result["failed_count"])
-        else:
-            logger.info("✓ No ALTER statements needed")
-    else:
-        logger.info("✓ No Oracle PK NUMBER columns need fixing")
-
-    # ========================================
-    # Step 2: Drop Constraints (BEFORE Full Load!)
-    # ========================================
-    logger.info("=" * 60)
-    logger.info("Step 2: Dropping FK Constraints")
-    logger.info("=" * 60)
-
-    from tools.constraint_manager import ConstraintManager
-
-    constraint_mgr = ConstraintManager(
-        host=pg_host,
-        port=pg_port,
-        database=pg_database,
-        user=pg_user,
-        password=pg_password,
-        schema=pg_schema
-    )
-
-    drop_result = constraint_mgr.drop_all_constraints()
-
-    if not drop_result["success"]:
-        logger.error("Failed to drop constraints: %s", drop_result.get("error"))
-        sys.exit(1)
-
-    logger.info("✓ Dropped %d constraints", drop_result["dropped_count"])
-
-    # ========================================
-    # Step 3: DMS Full Load (After type optimization!)
-    # ========================================
-    logger.info("=" * 60)
-    logger.info("Step 3: DMS Full Load")
-    logger.info("=" * 60)
-    from tools.dms_load import DMSFullLoader
-
-    dms_loader = DMSFullLoader()
-
-    # Discover DMS infrastructure
-    infra = dms_loader.discover_infrastructure()
-
-    if not infra["success"]:
-        logger.error("Failed to discover DMS infrastructure: %s", infra.get("error"))
-        sys.exit(1)
-
-    # Execute full load (24 hour timeout for large datasets)
-    load_result = dms_loader.execute(
-        schema=oracle_schema,
-        replication_instance_arn=infra["replication_instance_arn"],
-        source_endpoint_arn=infra["source_endpoint_arn"],
-        target_endpoint_arn=infra["target_endpoint_arn"],
-        timeout=86400  # 24 hours
-    )
-
-    if not load_result["success"]:
-        logger.error("DMS Full Load failed: %s", load_result.get("error"))
-        sys.exit(1)
-
-    # ========================================
-    # Step 4: Recreate Constraints
-    # ========================================
-    logger.info("=" * 60)
-    logger.info("Step 4: Recreating FK Constraints")
-    logger.info("=" * 60)
-    recreate_result = constraint_mgr.recreate_all_constraints()
-
-    if not recreate_result["success"]:
-        logger.error("Failed to recreate constraints: %s", recreate_result.get("error"))
-        sys.exit(1)
-
-    logger.info("✓ Recreated %d constraints", recreate_result["created_count"])
-
-    if recreate_result["failed"]:
-        logger.warning("Failed to recreate %d constraints:", len(recreate_result["failed"]))
-        for failed in recreate_result["failed"]:
-            logger.warning("  %s", failed)
-
-    # ========================================
-    # Step 5: Conversion Agent (AI-powered) - BACKGROUND
-    # ========================================
-    logger.info("=" * 60)
-    logger.info("Step 5: Launching Conversion Agent (Background)")
-    logger.info("=" * 60)
-
-    # Launch conversion agent in background (non-blocking)
-    # Agent will download S3 results and process failed objects
-    import subprocess
-    agent_script = os.path.join(os.path.dirname(__file__), "tools", "conversion_agent.py")
-
-    if os.path.exists(agent_script):
-        # Launch in background
-        subprocess.Popen([
-            sys.executable, agent_script,
-            "--schema", oracle_schema,
-            "--target-db", pg_database
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        logger.info("✓ Conversion Agent launched in background")
-        logger.info("  (Will download S3 results and convert complex objects)")
-        logger.info("  Log: /tmp/conversion_agent.log")
-    else:
-        logger.warning("Conversion Agent not found: %s", agent_script)
-
-    # ========================================
-    # Summary
-    # ========================================
-    logger.info("=" * 60)
-    logger.info("Migration Completed Successfully!")
-    logger.info("=" * 60)
-    logger.info("DMS SC: %d objects converted, %d failed",
-                assessment["converted"], assessment["failed"])
-    logger.info("Data Load: %d tables, %d rows",
-                load_result["statistics"].get("tables_loaded", 0),
-                load_result["statistics"].get("full_load_rows", 0))
-    logger.info("Constraints: %d dropped, %d recreated",
-                drop_result["dropped_count"],
-                recreate_result["created_count"])
-    logger.info("=" * 60)
+    return _dispatch(cfg, args)
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except KeyboardInterrupt:
-        logger.info("Interrupted by user")
+        logger.info("사용자에 의해 중단됨")
         sys.exit(130)
-    except Exception as e:
-        logger.exception("Migration failed")
+    except Exception:  # noqa: BLE001
+        logger.exception("예상치 못한 오류로 종료")
         sys.exit(1)
