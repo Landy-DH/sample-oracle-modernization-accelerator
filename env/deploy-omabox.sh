@@ -321,25 +321,28 @@ select_network_resources() {
 select_deployment_mode() {
     echo ""
     log_info "=== Deployment Mode Selection ==="
-    echo "1. Create new VPC and deploy all resources (complete infrastructure)"
-    echo "2. Use existing VPC and deploy Aurora/DMS only"
-    echo ""
-    read -p "Select deployment mode (1 or 2): " DEPLOYMENT_MODE
-    
-    case $DEPLOYMENT_MODE in
-        1)
-            log_success "Selected: Create new VPC (complete infrastructure)"
-            USE_EXISTING_VPC=false
-            ;;
-        2)
-            log_success "Selected: Use existing VPC"
-            USE_EXISTING_VPC=true
-            ;;
-        *)
-            log_error "Invalid selection. Please select 1 or 2."
-            exit 1
-            ;;
-    esac
+    # 하드코딩: 기존 VPC 사용 고정
+    USE_EXISTING_VPC=true
+    log_success "Selected: Use existing VPC (hardcoded)"
+    # echo "1. Create new VPC and deploy all resources (complete infrastructure)"
+    # echo "2. Use existing VPC and deploy Aurora/DMS only"
+    # echo ""
+    # read -p "Select deployment mode (1 or 2): " DEPLOYMENT_MODE
+    #
+    # case $DEPLOYMENT_MODE in
+    #     1)
+    #         log_success "Selected: Create new VPC (complete infrastructure)"
+    #         USE_EXISTING_VPC=false
+    #         ;;
+    #     2)
+    #         log_success "Selected: Use existing VPC"
+    #         USE_EXISTING_VPC=true
+    #         ;;
+    #     *)
+    #         log_error "Invalid selection. Please select 1 or 2."
+    #         exit 1
+    #         ;;
+    # esac
 }
 
 # Function to deploy CloudFormation
@@ -728,15 +731,22 @@ main() {
     echo ""
 
     # AWS 리전 입력 (명령행에서 지정되지 않은 경우)
-    if [[ -z "$REGION" ]] || [[ "$REGION" == "ap-northeast-2" ]]; then
-        read -p "Enter AWS Region [ap-northeast-2]: " INPUT_REGION
-        REGION=${INPUT_REGION:-ap-northeast-2}
-    fi
-    
+    # 하드코딩: 서울 리전 고정
+    REGION="ap-northeast-2"
+    # if [[ -z "$REGION" ]] || [[ "$REGION" == "ap-northeast-2" ]]; then
+    #     read -p "Enter AWS Region [ap-northeast-2]: " INPUT_REGION
+    #     REGION=${INPUT_REGION:-ap-northeast-2}
+    # fi
+
     log_info "Using AWS Region: $REGION"
 
     # 타겟 데이터베이스 선택
-    select_target_database
+    # select_target_database
+    # 하드코딩: PostgreSQL 고정
+    TARGET_DB="postgres"
+    TARGET_DB_NAME="PostgreSQL"
+    TARGET_SECRET_PREFIX="postgres"
+    log_success "Selected: Aurora PostgreSQL (hardcoded)"
 
     # 실행 옵션 선택 (명령행에서 지정되지 않은 경우)
     if [[ -z "$OPTION" ]]; then
