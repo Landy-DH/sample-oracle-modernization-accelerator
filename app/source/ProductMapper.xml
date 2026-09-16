@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+    "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  OMA Workshop 샘플 MyBatis 매퍼 - 상품 관리
+  Oracle 전용 SQL 구문 포함 (OMA 앱 변환 실습용)
+  
+  포함된 Oracle 구문:
+    - UTL_RAW.CAST_TO_VARCHAR2, HEXTORAW
+    - REGEXP_LIKE, REGEXP_REPLACE, REGEXP_SUBSTR
+    - XMLAGG, XMLELEMENT (XML 집계)
+    - NVL, COALESCE
+    - FLOOR, CEIL, MOD, ABS, POWER, SQRT
+    - TRUNC(숫자), ROUND
+-->
+
+<mapper namespace="com.oma.workshop.mapper.ProductMapper">
+
+    <!-- ========================================
+         SELECT: 상품 단건 조회
+         Oracle: NVL, UTL_RAW, DECODE
+         ======================================== -->
+    <select id="selectProductById" parameterType="int" resultType="map">
+        SELECT PRODUCT_ID,
+               PRODUCT_NAME,
+               NVL(CATEGORY, '미분류') AS CATEGORY,
+               FN_FORMAT_AMOUNT(UNIT_PRICE) AS UNIT_PRICE,
+               WEIGHT,
+               UTL_RAW.CAST_TO_VARCHAR2(PRODUCT_CODE) AS PRODUCT_CODE_STR,
+               NVL(DESCRIPTION, '설명 없음') AS DESCRIPTION,
+               DECODE(IS_ACTIVE, 1, '판매중', 0, '판매중지', '알수없음') AS STATUS,
+               TO_CHAR(CREATED_DATE, 'YYYY-MM-DD') AS CREATED_DATE
+        FROM PRODUCTS
+        WHERE PRODUCT_ID = #{productId}
+    </select>
+
+    <!-- ========================================
+         SELECT: 상품 검색 (정규식)
+         Oracle: REGEXP_LIKE, REGEXP_REPLACE, NVL
+         ======================================== -->
+    <select id="searchProducts" parameterType="map" resultType="map">
+        SELECT PRODUCT_ID,
+               PRODUCT_NAME,
+               CATEGORY,
+               FN_FORMAT_AMOUNT(UNIT_PRICE) AS UNIT_PRICE,
+               REGEXP_REPLACE(DESCRIPTION, '\s+', ' ') AS DESCRIPTION_CLEAN
+        FROM PRODUCTS
+        WHERE IS_ACTIVE = 1
+        <if test="keyword != null and keyword != ''">
+            AND (REGEXP_LIKE(PRODUCT_NAME, #{keyword}, 'i')
+                 OR REGEXP_LIKE(NVL(DESCRIPTION, ''), #{keyword}, 'i'))
+        </if>
+        <if test="category != null and category != ''">
+            AND CATEGORY = #{category}
+        </if>
+        <if test="minPrice != null">
+            AND UNIT_PRICE &gt;= #{minPrice}
+        </if>
+        <if test="maxPrice != null">
+            AND UNIT_PRICE &lt;= #{maxPrice}
+        </if>
+        ORDER BY
+        <choose>
+            <when test="sortBy == 'PRICE_ASC'">UNIT_PRICE ASC</when>
+            <when test="sortBy == 'PRICE_DESC'">UNIT_PRICE DESC</when>
+            <when test="sortBy == 'NAME'">PRODUCT_NAME ASC</when>
+            <otherwise>PRODUCT_ID DESC</otherwise>
+        </choose>
+    </select>
+
+    <!-- ========================================
+         SELECT: 카테고리별 상품 현황
+         Oracle: DECODE, NVL, GROUP BY, HAVING
+         ======================================== -->
+    <select id="selectProductsByCategory" resultType="map">
+        SELECT DECODE(CATEGORY,
+                   'ELEC', '전자제품',
+                   'FOOD', '식품',
+                   'CLOTH', '의류',
+                   'BOOK', '도서',
+                   '기타') AS CATEGORY_NM,
+               CATEGORY,
+               COUNT(*) AS PRODUCT_COUNT,
+               FN_FORMAT_AMOUNT(ROUND(AVG(UNIT_PRICE), 0)) AS AVG_PRICE,
+               FN_FORMAT_AMOUNT(MIN(UNIT_PRICE)) AS MIN_PRICE,
+               FN_FORMAT_AMOUNT(MAX(UNIT_PRICE)) AS MAX_PRICE,
+               ROUND(SQRT(VARIANCE(UNIT_PRICE)), 2) AS PRICE_STDDEV
+        FROM PRODUCTS
+        WHERE IS_ACTIVE = 1
+        GROUP BY CATEGORY
+        HAVING COUNT(*) &gt;= 1
+        ORDER BY PRODUCT_COUNT DESC
+    </select>
+
+    <!-- ========================================
+         INSERT: 상품 등록
+         Oracle: SEQ.NEXTVAL, SYSDATE, UTL_RAW, NVL
+         ======================================== -->
+    <insert id="insertProduct" parameterType="map">
+        INSERT INTO PRODUCTS (
+            PRODUCT_ID, PRODUCT_NAME, CATEGORY, UNIT_PRICE,
+            WEIGHT, PRODUCT_CODE, DESCRIPTION, IS_ACTIVE, CREATED_DATE
+        ) VALUES (
+            SEQ_PRODUCT.NEXTVAL,
+            #{productName},
+            #{category},
+            #{unitPrice},
+            #{weight},
+            UTL_RAW.CAST_TO_RAW(#{productCode}),
+            #{description},
+            NVL(#{isActive}, 1),
+            SYSDATE
+        )
+    </insert>
+
+    <!-- ========================================
+         UPDATE: 상품 가격 일괄 변경
+         Oracle: GREATEST, ROUND, DECODE
+         ======================================== -->
+    <update id="updatePriceByCategory" parameterType="map">
+        UPDATE PRODUCTS
+        SET UNIT_PRICE = GREATEST(
+                ROUND(UNIT_PRICE * (1 + #{changeRate} / 100), 0),
+                100
+            )
+        WHERE CATEGORY = #{category}
+          AND IS_ACTIVE = 1
+    </update>
+
+    <!-- ========================================
+         SELECT: 상품 판매 실적
+         Oracle: NVL, COALESCE, 분석함수, NTILE
+         ======================================== -->
+    <select id="selectProductSalesPerformance" resultType="map">
+        SELECT P.PRODUCT_ID,
+               P.PRODUCT_NAME,
+               P.CATEGORY,
+               COALESCE(S.TOTAL_QTY, 0) AS TOTAL_QTY,
+               FN_FORMAT_AMOUNT(COALESCE(S.TOTAL_REVENUE, 0)) AS TOTAL_REVENUE,
+               COALESCE(S.ORDER_CNT, 0) AS ORDER_COUNT,
+               NTILE(4) OVER (ORDER BY COALESCE(S.TOTAL_REVENUE, 0) DESC) AS QUARTILE,
+               CASE NTILE(4) OVER (ORDER BY COALESCE(S.TOTAL_REVENUE, 0) DESC)
+                   WHEN 1 THEN 'A등급'
+                   WHEN 2 THEN 'B등급'
+                   WHEN 3 THEN 'C등급'
+                   ELSE 'D등급'
+               END AS GRADE
+        FROM PRODUCTS P
+        LEFT JOIN (
+            SELECT PRODUCT_ID,
+                   SUM(QUANTITY) AS TOTAL_QTY,
+                   SUM(QUANTITY * UNIT_PRICE - NVL(DISCOUNT_AMT, 0)) AS TOTAL_REVENUE,
+                   COUNT(DISTINCT ORDER_ID) AS ORDER_CNT
+            FROM ORDER_ITEMS
+            GROUP BY PRODUCT_ID
+        ) S ON P.PRODUCT_ID = S.PRODUCT_ID
+        WHERE P.IS_ACTIVE = 1
+        ORDER BY COALESCE(S.TOTAL_REVENUE, 0) DESC
+    </select>
+
+    <!-- ========================================
+         SELECT: 코드 마스터 조회
+         Oracle: NVL, DECODE
+         ======================================== -->
+    <select id="selectCodeList" parameterType="string" resultType="map">
+        SELECT CODE_VALUE,
+               CODE_NAME,
+               NVL(DESCRIPTION, '') AS DESCRIPTION,
+               SORT_ORDER
+        FROM CODE_MASTER
+        WHERE CODE_GROUP = #{codeGroup}
+          AND USE_YN = 'Y'
+        ORDER BY SORT_ORDER, CODE_VALUE
+    </select>
+
+</mapper>

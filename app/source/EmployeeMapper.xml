@@ -1,0 +1,200 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+    "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  OMA Workshop 샘플 MyBatis 매퍼 - 직원/조직 관리
+  Oracle 전용 SQL 구문 포함 (OMA 앱 변환 실습용)
+  
+  포함된 Oracle 구문:
+    - CONNECT BY PRIOR (계층 쿼리)
+    - START WITH
+    - SYS_CONNECT_BY_PATH
+    - LEVEL
+    - PRIOR
+    - LPAD (트리 들여쓰기)
+    - NVL, DECODE, TO_CHAR
+    - WM_CONCAT 대안 (LISTAGG)
+-->
+
+<mapper namespace="com.oma.workshop.mapper.EmployeeMapper">
+
+    <!-- ========================================
+         SELECT: 직원 단건 조회
+         Oracle: NVL, DECODE, TO_CHAR, FN_FORMAT_AMOUNT
+         ======================================== -->
+    <select id="selectEmployeeById" parameterType="int" resultType="map">
+        SELECT E.EMPLOYEE_ID,
+               E.EMPLOYEE_NAME,
+               E.DEPARTMENT,
+               E.POSITION_TITLE,
+               TO_CHAR(E.HIRE_DATE, 'YYYY-MM-DD') AS HIRE_DATE,
+               TRUNC(MONTHS_BETWEEN(SYSDATE, E.HIRE_DATE) / 12) AS YEARS_WORKED,
+               FN_FORMAT_AMOUNT(E.SALARY) AS SALARY,
+               NVL(E.COMMISSION_PCT, 0) * 100 || '%' AS COMMISSION,
+               FN_FORMAT_AMOUNT(E.SALARY * (1 + NVL(E.COMMISSION_PCT, 0))) AS TOTAL_COMPENSATION,
+               NVL(M.EMPLOYEE_NAME, '(최상위)') AS MANAGER_NAME,
+               E.EMAIL,
+               E.PHONE_EXT
+        FROM EMPLOYEES E
+        LEFT JOIN EMPLOYEES M ON E.MANAGER_ID = M.EMPLOYEE_ID
+        WHERE E.EMPLOYEE_ID = #{employeeId}
+    </select>
+
+    <!-- ========================================
+         SELECT: 조직도 (계층 쿼리)
+         Oracle: CONNECT BY PRIOR, START WITH, LEVEL, SYS_CONNECT_BY_PATH, LPAD
+         ======================================== -->
+    <select id="selectOrgChart" resultType="map">
+        SELECT EMPLOYEE_ID,
+               EMPLOYEE_NAME,
+               DEPARTMENT,
+               POSITION_TITLE,
+               MANAGER_ID,
+               LEVEL AS ORG_LEVEL,
+               LPAD(' ', (LEVEL - 1) * 4) || EMPLOYEE_NAME AS ORG_TREE,
+               SYS_CONNECT_BY_PATH(EMPLOYEE_NAME, ' > ') AS FULL_PATH,
+               CONNECT_BY_ISLEAF AS IS_LEAF
+        FROM EMPLOYEES
+        START WITH MANAGER_ID IS NULL
+        CONNECT BY PRIOR EMPLOYEE_ID = MANAGER_ID
+        ORDER SIBLINGS BY DEPARTMENT, EMPLOYEE_NAME
+    </select>
+
+    <!-- ========================================
+         SELECT: 특정 직원의 하위 조직
+         Oracle: CONNECT BY, START WITH, LEVEL
+         ======================================== -->
+    <select id="selectSubordinates" parameterType="int" resultType="map">
+        SELECT EMPLOYEE_ID,
+               EMPLOYEE_NAME,
+               DEPARTMENT,
+               POSITION_TITLE,
+               LEVEL - 1 AS DEPTH,
+               LPAD('└─ ', (LEVEL - 1) * 3) || EMPLOYEE_NAME AS TREE_VIEW
+        FROM EMPLOYEES
+        START WITH EMPLOYEE_ID = #{managerId}
+        CONNECT BY PRIOR EMPLOYEE_ID = MANAGER_ID
+        ORDER SIBLINGS BY EMPLOYEE_NAME
+    </select>
+
+    <!-- ========================================
+         SELECT: 부서별 급여 통계
+         Oracle: NVL, DECODE, ROUND, GROUP BY ROLLUP
+         ======================================== -->
+    <select id="selectDeptSalaryStats" resultType="map">
+        SELECT NVL(DEPARTMENT, '전체') AS DEPARTMENT,
+               COUNT(*) AS EMP_COUNT,
+               FN_FORMAT_AMOUNT(ROUND(AVG(SALARY), 0)) AS AVG_SALARY,
+               FN_FORMAT_AMOUNT(MIN(SALARY)) AS MIN_SALARY,
+               FN_FORMAT_AMOUNT(MAX(SALARY)) AS MAX_SALARY,
+               FN_FORMAT_AMOUNT(SUM(SALARY)) AS TOTAL_SALARY,
+               FN_FORMAT_AMOUNT(ROUND(SUM(SALARY * NVL(COMMISSION_PCT, 0)), 0)) AS TOTAL_COMMISSION
+        FROM EMPLOYEES
+        GROUP BY ROLLUP(DEPARTMENT)
+        ORDER BY DEPARTMENT NULLS LAST
+    </select>
+
+    <!-- ========================================
+         SELECT: 부서별 직원 목록 (LISTAGG)
+         Oracle: LISTAGG, WITHIN GROUP
+         ======================================== -->
+    <select id="selectDeptEmployeeList" resultType="map">
+        SELECT DEPARTMENT,
+               COUNT(*) AS EMP_COUNT,
+               LISTAGG(EMPLOYEE_NAME || '(' || POSITION_TITLE || ')', ', ')
+                   WITHIN GROUP (ORDER BY SALARY DESC) AS MEMBER_LIST
+        FROM EMPLOYEES
+        GROUP BY DEPARTMENT
+        ORDER BY DEPARTMENT
+    </select>
+
+    <!-- ========================================
+         SELECT: 급여 순위 (분석함수)
+         Oracle: DENSE_RANK, PERCENT_RANK, CUME_DIST, NTILE
+         ======================================== -->
+    <select id="selectSalaryRanking" parameterType="string" resultType="map">
+        SELECT EMPLOYEE_ID,
+               EMPLOYEE_NAME,
+               DEPARTMENT,
+               POSITION_TITLE,
+               SALARY,
+               DENSE_RANK() OVER (ORDER BY SALARY DESC) AS SALARY_RANK,
+               DENSE_RANK() OVER (PARTITION BY DEPARTMENT ORDER BY SALARY DESC) AS DEPT_RANK,
+               ROUND(PERCENT_RANK() OVER (ORDER BY SALARY) * 100, 1) AS PERCENTILE,
+               ROUND(CUME_DIST() OVER (ORDER BY SALARY) * 100, 1) AS CUMULATIVE_PCT,
+               NTILE(3) OVER (ORDER BY SALARY DESC) AS SALARY_TIER
+        FROM EMPLOYEES
+        <where>
+            <if test="department != null and department != ''">
+                DEPARTMENT = #{department}
+            </if>
+        </where>
+        ORDER BY SALARY DESC
+    </select>
+
+    <!-- ========================================
+         INSERT: 직원 등록
+         Oracle: SEQ.NEXTVAL, TO_DATE, NVL
+         ======================================== -->
+    <insert id="insertEmployee" parameterType="map">
+        INSERT INTO EMPLOYEES (
+            EMPLOYEE_ID, EMPLOYEE_NAME, DEPARTMENT, POSITION_TITLE,
+            HIRE_DATE, SALARY, COMMISSION_PCT, MANAGER_ID, EMAIL, PHONE_EXT
+        ) VALUES (
+            SEQ_EMPLOYEE.NEXTVAL,
+            #{employeeName},
+            #{department},
+            #{positionTitle},
+            NVL(TO_DATE(#{hireDate}, 'YYYY-MM-DD'), SYSDATE),
+            #{salary},
+            #{commissionPct},
+            #{managerId},
+            #{email},
+            #{phoneExt}
+        )
+    </insert>
+
+    <!-- ========================================
+         UPDATE: 급여 인상
+         Oracle: GREATEST, ROUND, NVL, DECODE
+         ======================================== -->
+    <update id="updateSalary" parameterType="map">
+        UPDATE EMPLOYEES
+        SET SALARY = GREATEST(
+                ROUND(SALARY * (1 + #{raiseRate} / 100), -3),
+                SALARY
+            ),
+            COMMISSION_PCT = DECODE(#{adjustCommission}, 'Y',
+                LEAST(NVL(COMMISSION_PCT, 0) + 0.02, 0.30),
+                COMMISSION_PCT)
+        WHERE EMPLOYEE_ID = #{employeeId}
+    </update>
+
+    <!-- ========================================
+         SELECT: 감사 로그 조회
+         Oracle: TO_CHAR, NVL, SUBSTR
+         ======================================== -->
+    <select id="selectAuditLog" parameterType="map" resultType="map">
+        SELECT LOG_ID,
+               TABLE_NAME,
+               OPERATION,
+               SUBSTR(NVL(OLD_VALUE, ''), 1, 200) AS OLD_VALUE_SHORT,
+               SUBSTR(NVL(NEW_VALUE, ''), 1, 200) AS NEW_VALUE_SHORT,
+               NVL(CHANGED_BY, 'SYSTEM') AS CHANGED_BY,
+               TO_CHAR(CHANGED_AT, 'YYYY-MM-DD HH24:MI:SS') AS CHANGED_AT
+        FROM AUDIT_LOG
+        WHERE 1 = 1
+        <if test="tableName != null">
+            AND TABLE_NAME = #{tableName}
+        </if>
+        <if test="startDate != null">
+            AND CHANGED_AT &gt;= TO_TIMESTAMP(#{startDate}, 'YYYY-MM-DD')
+        </if>
+        <if test="endDate != null">
+            AND CHANGED_AT &lt;= TO_TIMESTAMP(#{endDate} || ' 23:59:59', 'YYYY-MM-DD HH24:MI:SS')
+        </if>
+        ORDER BY CHANGED_AT DESC
+    </select>
+
+</mapper>

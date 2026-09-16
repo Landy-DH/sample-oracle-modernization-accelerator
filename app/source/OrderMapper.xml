@@ -1,0 +1,335 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+    "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  OMA Workshop 샘플 MyBatis 매퍼 - 주문 관리
+  Oracle 전용 SQL 구문 포함 (OMA 앱 변환 실습용)
+  
+  포함된 Oracle 구문:
+    - MERGE INTO
+    - 윈도우 함수 (ROW_NUMBER, RANK, LAG, LEAD, SUM OVER)
+    - 분석 함수 (RATIO_TO_REPORT)
+    - Oracle 힌트 (/*+ INDEX */)
+    - CONNECT BY LEVEL (행 생성)
+    - COALESCE, GREATEST, LEAST
+    - EXTRACT(YEAR/MONTH FROM ...)
+    - INTERVAL
+    - WITH (CTE) + 재귀
+-->
+
+<mapper namespace="com.oma.workshop.mapper.OrderMapper">
+
+    <!-- ========================================
+         SELECT: 주문 단건 조회
+         Oracle: NVL, DECODE, TO_CHAR, 사용자함수
+         ======================================== -->
+    <select id="selectOrderById" parameterType="int" resultType="map">
+        SELECT O.ORDER_ID,
+               O.CUSTOMER_ID,
+               C.CUSTOMER_NAME,
+               TO_CHAR(O.ORDER_DATE, 'YYYY-MM-DD') AS ORDER_DATE,
+               TO_CHAR(O.SHIP_DATE, 'YYYY-MM-DD') AS SHIP_DATE,
+               FN_FORMAT_AMOUNT(O.TOTAL_AMOUNT) AS TOTAL_AMOUNT,
+               FN_FORMAT_AMOUNT(NVL(O.TAX_AMOUNT, 0)) AS TAX_AMOUNT,
+               FN_FORMAT_AMOUNT(O.TOTAL_AMOUNT - NVL(O.TAX_AMOUNT, 0)) AS NET_AMOUNT,
+               O.DISCOUNT_RATE || '%' AS DISCOUNT_RATE,
+               DECODE(O.ORDER_STATUS,
+                   'PENDING', '대기',
+                   'CONFIRMED', '확인',
+                   'SHIPPED', '배송중',
+                   'DELIVERED', '완료',
+                   'CANCELLED', '취소',
+                   '알수없음') AS ORDER_STATUS,
+               NVL(O.PAYMENT_METHOD, '미정') AS PAYMENT_METHOD,
+               NVL(O.REMARKS, '') AS REMARKS,
+               FN_GET_ORDER_TOTAL(O.ORDER_ID) AS CALCULATED_TOTAL,
+               TO_CHAR(O.CREATED_AT, 'YYYY-MM-DD HH24:MI:SS TZH:TZM') AS CREATED_AT
+        FROM ORDERS O
+        JOIN CUSTOMERS C ON O.CUSTOMER_ID = C.CUSTOMER_ID
+        WHERE O.ORDER_ID = #{orderId}
+    </select>
+
+    <!-- ========================================
+         SELECT: 주문 목록 (기간 + 상태 필터, 페이징)
+         Oracle: ROWNUM, TO_DATE, BETWEEN, NVL, 서브쿼리
+         ======================================== -->
+    <select id="selectOrderList" parameterType="map" resultType="map">
+        SELECT *
+        FROM (
+            SELECT ROWNUM AS RNUM, A.*
+            FROM (
+                SELECT /*+ INDEX(O IDX_ORD_DATE) */
+                       O.ORDER_ID,
+                       C.CUSTOMER_NAME,
+                       TO_CHAR(O.ORDER_DATE, 'YYYY-MM-DD') AS ORDER_DATE,
+                       FN_FORMAT_AMOUNT(O.TOTAL_AMOUNT) AS TOTAL_AMOUNT,
+                       O.ORDER_STATUS,
+                       NVL(O.PAYMENT_METHOD, '-') AS PAYMENT_METHOD,
+                       (SELECT COUNT(*) FROM ORDER_ITEMS OI WHERE OI.ORDER_ID = O.ORDER_ID) AS ITEM_COUNT
+                FROM ORDERS O
+                JOIN CUSTOMERS C ON O.CUSTOMER_ID = C.CUSTOMER_ID
+                WHERE 1 = 1
+                <if test="startDate != null and startDate != ''">
+                    AND O.ORDER_DATE &gt;= TO_DATE(#{startDate}, 'YYYY-MM-DD')
+                </if>
+                <if test="endDate != null and endDate != ''">
+                    AND O.ORDER_DATE &lt;= TO_DATE(#{endDate}, 'YYYY-MM-DD')
+                </if>
+                <if test="orderStatus != null and orderStatus != ''">
+                    AND O.ORDER_STATUS = #{orderStatus}
+                </if>
+                <if test="customerId != null">
+                    AND O.CUSTOMER_ID = #{customerId}
+                </if>
+                ORDER BY O.ORDER_DATE DESC, O.ORDER_ID DESC
+            ) A
+            WHERE ROWNUM &lt;= #{endRow}
+        )
+        WHERE RNUM &gt;= #{startRow}
+    </select>
+
+    <!-- ========================================
+         SELECT: 주문 상세 품목 조회
+         Oracle: NVL, DECODE, ROUND
+         ======================================== -->
+    <select id="selectOrderItems" parameterType="int" resultType="map">
+        SELECT OI.ITEM_SEQ,
+               P.PRODUCT_NAME,
+               P.CATEGORY,
+               OI.QUANTITY,
+               FN_FORMAT_AMOUNT(OI.UNIT_PRICE) AS UNIT_PRICE,
+               FN_FORMAT_AMOUNT(NVL(OI.DISCOUNT_AMT, 0)) AS DISCOUNT_AMT,
+               FN_FORMAT_AMOUNT(OI.QUANTITY * OI.UNIT_PRICE - NVL(OI.DISCOUNT_AMT, 0)) AS LINE_TOTAL,
+               ROUND(NVL(OI.DISCOUNT_AMT, 0) / NULLIF(OI.QUANTITY * OI.UNIT_PRICE, 0) * 100, 1) AS DISCOUNT_PCT
+        FROM ORDER_ITEMS OI
+        JOIN PRODUCTS P ON OI.PRODUCT_ID = P.PRODUCT_ID
+        WHERE OI.ORDER_ID = #{orderId}
+        ORDER BY OI.ITEM_SEQ
+    </select>
+
+    <!-- ========================================
+         INSERT: 주문 생성
+         Oracle: SEQ.NEXTVAL, SYSDATE, SYSTIMESTAMP, NVL
+         ======================================== -->
+    <insert id="insertOrder" parameterType="map">
+        <selectKey keyProperty="orderId" resultType="int" order="BEFORE">
+            SELECT SEQ_ORDER.NEXTVAL FROM DUAL
+        </selectKey>
+        INSERT INTO ORDERS (
+            ORDER_ID, CUSTOMER_ID, ORDER_DATE, TOTAL_AMOUNT,
+            TAX_AMOUNT, DISCOUNT_RATE, ORDER_STATUS, PAYMENT_METHOD, REMARKS, CREATED_AT
+        ) VALUES (
+            #{orderId}, #{customerId}, SYSDATE, 0,
+            0, NVL(#{discountRate}, 0), 'PENDING', #{paymentMethod}, #{remarks}, SYSTIMESTAMP
+        )
+    </insert>
+
+    <!-- ========================================
+         INSERT: 주문 상세 추가
+         Oracle: NVL, 서브쿼리 MAX
+         ======================================== -->
+    <insert id="insertOrderItem" parameterType="map">
+        INSERT INTO ORDER_ITEMS (ORDER_ID, ITEM_SEQ, PRODUCT_ID, QUANTITY, UNIT_PRICE, DISCOUNT_AMT)
+        VALUES (
+            #{orderId},
+            (SELECT NVL(MAX(ITEM_SEQ), 0) + 1 FROM ORDER_ITEMS WHERE ORDER_ID = #{orderId}),
+            #{productId},
+            #{quantity},
+            (SELECT UNIT_PRICE FROM PRODUCTS WHERE PRODUCT_ID = #{productId}),
+            NVL(#{discountAmt}, 0)
+        )
+    </insert>
+
+    <!-- ========================================
+         UPDATE: 주문 총액 재계산
+         Oracle: NVL, SUM, 서브쿼리
+         ======================================== -->
+    <update id="recalculateOrderTotal" parameterType="int">
+        UPDATE ORDERS
+        SET TOTAL_AMOUNT = (
+                SELECT NVL(SUM(QUANTITY * UNIT_PRICE - NVL(DISCOUNT_AMT, 0)), 0)
+                FROM ORDER_ITEMS
+                WHERE ORDER_ID = #{orderId}
+            ),
+            TAX_AMOUNT = (
+                SELECT ROUND(NVL(SUM(QUANTITY * UNIT_PRICE - NVL(DISCOUNT_AMT, 0)), 0) * 0.1, 2)
+                FROM ORDER_ITEMS
+                WHERE ORDER_ID = #{orderId}
+            ),
+            UPD_DATE = SYSTIMESTAMP
+        WHERE ORDER_ID = #{orderId}
+    </update>
+
+    <!-- ========================================
+         UPDATE: 주문 상태 변경
+         Oracle: SYSDATE, CASE WHEN, SYSTIMESTAMP
+         ======================================== -->
+    <update id="updateOrderStatus" parameterType="map">
+        UPDATE ORDERS
+        SET ORDER_STATUS = #{newStatus},
+            SHIP_DATE = CASE
+                WHEN #{newStatus} = 'SHIPPED' AND SHIP_DATE IS NULL THEN SYSDATE
+                ELSE SHIP_DATE
+            END,
+            UPD_DATE = SYSTIMESTAMP
+        WHERE ORDER_ID = #{orderId}
+          AND ORDER_STATUS != 'CANCELLED'
+    </update>
+
+    <!-- ========================================
+         SELECT: 월별 매출 집계
+         Oracle: TO_CHAR, GROUP BY, NVL, DECODE, ROLLUP
+         ======================================== -->
+    <select id="selectMonthlySales" parameterType="map" resultType="map">
+        SELECT NVL(TO_CHAR(ORDER_DATE, 'YYYY-MM'), '합계') AS SALES_MONTH,
+               COUNT(*) AS ORDER_COUNT,
+               FN_FORMAT_AMOUNT(SUM(TOTAL_AMOUNT)) AS TOTAL_SALES,
+               FN_FORMAT_AMOUNT(ROUND(AVG(TOTAL_AMOUNT), 2)) AS AVG_ORDER,
+               FN_FORMAT_AMOUNT(MAX(TOTAL_AMOUNT)) AS MAX_ORDER,
+               FN_FORMAT_AMOUNT(MIN(TOTAL_AMOUNT)) AS MIN_ORDER
+        FROM ORDERS
+        WHERE ORDER_STATUS NOT IN ('CANCELLED')
+        <if test="year != null">
+            AND EXTRACT(YEAR FROM ORDER_DATE) = #{year}
+        </if>
+        GROUP BY ROLLUP(TO_CHAR(ORDER_DATE, 'YYYY-MM'))
+        ORDER BY SALES_MONTH
+    </select>
+
+    <!-- ========================================
+         SELECT: 매출 순위 (윈도우 함수)
+         Oracle: ROW_NUMBER, RANK, LAG, LEAD, SUM OVER, RATIO_TO_REPORT
+         ======================================== -->
+    <select id="selectSalesRanking" parameterType="map" resultType="map">
+        SELECT ORDER_ID,
+               CUSTOMER_NAME,
+               ORDER_DATE,
+               TOTAL_AMOUNT,
+               ROW_NUMBER() OVER (ORDER BY TOTAL_AMOUNT DESC) AS RN,
+               RANK() OVER (ORDER BY TOTAL_AMOUNT DESC) AS SALES_RANK,
+               LAG(TOTAL_AMOUNT) OVER (ORDER BY ORDER_DATE) AS PREV_ORDER_AMT,
+               LEAD(TOTAL_AMOUNT) OVER (ORDER BY ORDER_DATE) AS NEXT_ORDER_AMT,
+               SUM(TOTAL_AMOUNT) OVER (ORDER BY ORDER_DATE ROWS UNBOUNDED PRECEDING) AS RUNNING_TOTAL,
+               ROUND(RATIO_TO_REPORT(TOTAL_AMOUNT) OVER () * 100, 2) AS SALES_PCT
+        FROM (
+            SELECT O.ORDER_ID,
+                   C.CUSTOMER_NAME,
+                   TO_CHAR(O.ORDER_DATE, 'YYYY-MM-DD') AS ORDER_DATE,
+                   O.TOTAL_AMOUNT
+            FROM ORDERS O
+            JOIN CUSTOMERS C ON O.CUSTOMER_ID = C.CUSTOMER_ID
+            WHERE O.ORDER_STATUS = 'DELIVERED'
+            <if test="year != null">
+                AND EXTRACT(YEAR FROM O.ORDER_DATE) = #{year}
+            </if>
+        )
+    </select>
+
+    <!-- ========================================
+         SELECT: 카테고리별 매출 (PIVOT 스타일)
+         Oracle: DECODE, SUM, GROUP BY
+         ======================================== -->
+    <select id="selectSalesByCategory" resultType="map">
+        SELECT TO_CHAR(O.ORDER_DATE, 'YYYY-MM') AS SALES_MONTH,
+               SUM(DECODE(P.CATEGORY, 'ELEC', OI.QUANTITY * OI.UNIT_PRICE, 0)) AS ELEC_SALES,
+               SUM(DECODE(P.CATEGORY, 'FOOD', OI.QUANTITY * OI.UNIT_PRICE, 0)) AS FOOD_SALES,
+               SUM(DECODE(P.CATEGORY, 'CLOTH', OI.QUANTITY * OI.UNIT_PRICE, 0)) AS CLOTH_SALES,
+               SUM(DECODE(P.CATEGORY, 'BOOK', OI.QUANTITY * OI.UNIT_PRICE, 0)) AS BOOK_SALES,
+               SUM(OI.QUANTITY * OI.UNIT_PRICE) AS TOTAL_SALES
+        FROM ORDERS O
+        JOIN ORDER_ITEMS OI ON O.ORDER_ID = OI.ORDER_ID
+        JOIN PRODUCTS P ON OI.PRODUCT_ID = P.PRODUCT_ID
+        WHERE O.ORDER_STATUS != 'CANCELLED'
+        GROUP BY TO_CHAR(O.ORDER_DATE, 'YYYY-MM')
+        ORDER BY 1
+    </select>
+
+    <!-- ========================================
+         MERGE: 주문 upsert
+         Oracle: MERGE INTO ... USING ... ON ... WHEN MATCHED/NOT MATCHED
+         ======================================== -->
+    <update id="mergeOrder" parameterType="map">
+        MERGE INTO ORDERS O
+        USING (SELECT #{orderId} AS ORDER_ID FROM DUAL) S
+        ON (O.ORDER_ID = S.ORDER_ID)
+        WHEN MATCHED THEN
+            UPDATE SET
+                O.TOTAL_AMOUNT = #{totalAmount},
+                O.TAX_AMOUNT = ROUND(#{totalAmount} * 0.1, 2),
+                O.ORDER_STATUS = NVL(#{orderStatus}, O.ORDER_STATUS),
+                O.REMARKS = NVL(#{remarks}, O.REMARKS),
+                O.UPD_DATE = SYSTIMESTAMP
+        WHEN NOT MATCHED THEN
+            INSERT (ORDER_ID, CUSTOMER_ID, ORDER_DATE, TOTAL_AMOUNT, TAX_AMOUNT,
+                    ORDER_STATUS, PAYMENT_METHOD, REMARKS, CREATED_AT)
+            VALUES (SEQ_ORDER.NEXTVAL, #{customerId}, SYSDATE, #{totalAmount},
+                    ROUND(#{totalAmount} * 0.1, 2),
+                    NVL(#{orderStatus}, 'PENDING'), #{paymentMethod}, #{remarks}, SYSTIMESTAMP)
+    </update>
+
+    <!-- ========================================
+         SELECT: 날짜 범위 생성 (CONNECT BY LEVEL)
+         Oracle: CONNECT BY LEVEL, TRUNC, ADD_MONTHS
+         ======================================== -->
+    <select id="selectDailySalesSummary" parameterType="map" resultType="map">
+        WITH DATE_RANGE AS (
+            SELECT TO_DATE(#{startDate}, 'YYYY-MM-DD') + LEVEL - 1 AS SALE_DATE
+            FROM DUAL
+            CONNECT BY LEVEL &lt;= TO_DATE(#{endDate}, 'YYYY-MM-DD') - TO_DATE(#{startDate}, 'YYYY-MM-DD') + 1
+        )
+        SELECT TO_CHAR(D.SALE_DATE, 'YYYY-MM-DD') AS SALE_DATE,
+               TO_CHAR(D.SALE_DATE, 'DY', 'NLS_DATE_LANGUAGE=KOREAN') AS DAY_NAME,
+               NVL(O.ORDER_CNT, 0) AS ORDER_COUNT,
+               FN_FORMAT_AMOUNT(NVL(O.TOTAL_AMT, 0)) AS TOTAL_SALES
+        FROM DATE_RANGE D
+        LEFT JOIN (
+            SELECT TRUNC(ORDER_DATE) AS ORD_DATE,
+                   COUNT(*) AS ORDER_CNT,
+                   SUM(TOTAL_AMOUNT) AS TOTAL_AMT
+            FROM ORDERS
+            WHERE ORDER_STATUS != 'CANCELLED'
+            GROUP BY TRUNC(ORDER_DATE)
+        ) O ON D.SALE_DATE = O.ORD_DATE
+        ORDER BY D.SALE_DATE
+    </select>
+
+    <!-- ========================================
+         SELECT: 고객별 최근 주문 (분석함수)
+         Oracle: ROW_NUMBER OVER PARTITION BY, GREATEST, LEAST
+         ======================================== -->
+    <select id="selectLatestOrderByCustomer" resultType="map">
+        SELECT *
+        FROM (
+            SELECT C.CUSTOMER_ID,
+                   C.CUSTOMER_NAME,
+                   O.ORDER_ID,
+                   TO_CHAR(O.ORDER_DATE, 'YYYY-MM-DD') AS ORDER_DATE,
+                   O.TOTAL_AMOUNT,
+                   O.ORDER_STATUS,
+                   GREATEST(O.TOTAL_AMOUNT, NVL(O.TAX_AMOUNT, 0)) AS GREATER_AMT,
+                   LEAST(O.TOTAL_AMOUNT, NVL(C.CREDIT_LIMIT, 0)) AS LESSER_AMT,
+                   ROW_NUMBER() OVER (PARTITION BY C.CUSTOMER_ID ORDER BY O.ORDER_DATE DESC) AS RN
+            FROM CUSTOMERS C
+            JOIN ORDERS O ON C.CUSTOMER_ID = O.CUSTOMER_ID
+            WHERE O.ORDER_STATUS != 'CANCELLED'
+        )
+        WHERE RN = 1
+        ORDER BY CUSTOMER_NAME
+    </select>
+
+    <!-- ========================================
+         DELETE: 주문 취소 (논리 삭제)
+         Oracle: SYSDATE, SYSTIMESTAMP, || 문자열 연결
+         ======================================== -->
+    <update id="cancelOrder" parameterType="map">
+        UPDATE ORDERS
+        SET ORDER_STATUS = 'CANCELLED',
+            REMARKS = NVL(REMARKS, '') || CHR(10) || '[취소] '
+                || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI') || ' ' || NVL(#{cancelReason}, '사유 미입력'),
+            UPD_DATE = SYSTIMESTAMP
+        WHERE ORDER_ID = #{orderId}
+          AND ORDER_STATUS IN ('PENDING', 'CONFIRMED')
+    </update>
+
+</mapper>

@@ -1,0 +1,278 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+    "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  OMA Workshop 샘플 MyBatis 매퍼 - 고객 관리
+  Oracle 전용 SQL 구문 포함 (OMA 앱 변환 실습용)
+  
+  포함된 Oracle 구문:
+    - NVL, NVL2, DECODE, CASE WHEN
+    - TO_CHAR, TO_DATE, TO_NUMBER
+    - SYSDATE, SYSTIMESTAMP
+    - ROWNUM, ROWID
+    - SUBSTR, INSTR, REPLACE, TRIM, LPAD, RPAD
+    - MONTHS_BETWEEN, ADD_MONTHS, TRUNC(날짜)
+    - 시퀀스 (SEQ_CUSTOMER.NEXTVAL)
+    - 사용자 함수 (FN_MASK_STRING, FN_CALC_AGE, FN_FORMAT_AMOUNT)
+    - DUAL 테이블
+    - Oracle 힌트 (/*+ INDEX */, /*+ FULL */)
+    - CONNECT BY (계층 쿼리)
+    - LISTAGG
+    - MERGE INTO
+    - || 문자열 연결
+-->
+
+<mapper namespace="com.oma.workshop.mapper.CustomerMapper">
+
+    <!-- ========================================
+         ResultMap 정의
+         ======================================== -->
+    <resultMap id="customerResultMap" type="com.oma.workshop.model.Customer">
+        <id property="customerId" column="CUSTOMER_ID"/>
+        <result property="customerName" column="CUSTOMER_NAME"/>
+        <result property="email" column="EMAIL"/>
+        <result property="phone" column="PHONE"/>
+        <result property="address" column="ADDRESS"/>
+        <result property="customerType" column="CUSTOMER_TYPE"/>
+        <result property="creditLimit" column="CREDIT_LIMIT"/>
+        <result property="birthDate" column="BIRTH_DATE"/>
+        <result property="regDate" column="REG_DATE"/>
+        <result property="status" column="STATUS"/>
+    </resultMap>
+
+    <!-- ========================================
+         SELECT: 고객 단건 조회
+         Oracle: NVL, TO_CHAR, DECODE, 사용자함수
+         ======================================== -->
+    <select id="selectCustomerById" parameterType="int" resultMap="customerResultMap">
+        SELECT CUSTOMER_ID,
+               CUSTOMER_NAME,
+               NVL(EMAIL, '미등록') AS EMAIL,
+               NVL(PHONE, '미등록') AS PHONE,
+               NVL(ADDRESS, '미등록') AS ADDRESS,
+               DECODE(CUSTOMER_TYPE, 'P', '개인', 'B', '기업', '기타') AS CUSTOMER_TYPE,
+               FN_FORMAT_AMOUNT(CREDIT_LIMIT) AS CREDIT_LIMIT,
+               TO_CHAR(BIRTH_DATE, 'YYYY-MM-DD') AS BIRTH_DATE,
+               TO_CHAR(REG_DATE, 'YYYY-MM-DD HH24:MI:SS') AS REG_DATE,
+               STATUS
+        FROM CUSTOMERS
+        WHERE CUSTOMER_ID = #{customerId}
+    </select>
+
+    <!-- ========================================
+         SELECT: 고객 목록 조회 (페이징)
+         Oracle: ROWNUM, 서브쿼리 페이징, NVL2
+         ======================================== -->
+    <select id="selectCustomerList" parameterType="map" resultMap="customerResultMap">
+        SELECT *
+        FROM (
+            SELECT ROWNUM AS RNUM, A.*
+            FROM (
+                SELECT CUSTOMER_ID,
+                       CUSTOMER_NAME,
+                       NVL2(EMAIL, EMAIL, PHONE) AS CONTACT_INFO,
+                       DECODE(CUSTOMER_TYPE, 'P', '개인', 'B', '기업') AS CUSTOMER_TYPE,
+                       FN_FORMAT_AMOUNT(CREDIT_LIMIT) AS CREDIT_LIMIT,
+                       TO_CHAR(REG_DATE, 'YYYY-MM-DD') AS REG_DATE,
+                       STATUS
+                FROM CUSTOMERS
+                WHERE STATUS = NVL(#{status}, STATUS)
+                <if test="customerName != null and customerName != ''">
+                    AND UPPER(CUSTOMER_NAME) LIKE '%' || UPPER(#{customerName}) || '%'
+                </if>
+                <if test="customerType != null">
+                    AND CUSTOMER_TYPE = #{customerType}
+                </if>
+                ORDER BY CUSTOMER_ID DESC
+            ) A
+            WHERE ROWNUM &lt;= #{endRow}
+        )
+        WHERE RNUM &gt;= #{startRow}
+    </select>
+
+    <!-- ========================================
+         SELECT: 고객 검색 (동적 조건)
+         Oracle: NVL, LIKE, UPPER, SUBSTR, INSTR
+         ======================================== -->
+    <select id="searchCustomers" parameterType="map" resultMap="customerResultMap">
+        SELECT CUSTOMER_ID,
+               FN_MASK_STRING(CUSTOMER_NAME) AS CUSTOMER_NAME,
+               SUBSTR(NVL(EMAIL, ''), 1, INSTR(NVL(EMAIL, '@'), '@') - 1) AS EMAIL_ID,
+               REPLACE(PHONE, '-', '') AS PHONE,
+               LPAD(TO_CHAR(CUSTOMER_ID), 10, '0') AS CUSTOMER_NO,
+               STATUS
+        FROM CUSTOMERS
+        WHERE 1 = 1
+        <choose>
+            <when test="searchType == 'NAME'">
+                AND UPPER(CUSTOMER_NAME) LIKE '%' || UPPER(#{keyword}) || '%'
+            </when>
+            <when test="searchType == 'EMAIL'">
+                AND UPPER(EMAIL) LIKE '%' || UPPER(#{keyword}) || '%'
+            </when>
+            <when test="searchType == 'PHONE'">
+                AND REPLACE(PHONE, '-', '') LIKE '%' || REPLACE(#{keyword}, '-', '') || '%'
+            </when>
+            <otherwise>
+                AND (UPPER(CUSTOMER_NAME) LIKE '%' || UPPER(#{keyword}) || '%'
+                     OR UPPER(EMAIL) LIKE '%' || UPPER(#{keyword}) || '%')
+            </otherwise>
+        </choose>
+        ORDER BY CUSTOMER_NAME
+    </select>
+
+    <!-- ========================================
+         SELECT: 고객 상세 + 나이 계산
+         Oracle: 사용자함수(FN_CALC_AGE), MONTHS_BETWEEN, TRUNC
+         ======================================== -->
+    <select id="selectCustomerDetail" parameterType="int" resultType="map">
+        SELECT C.CUSTOMER_ID,
+               C.CUSTOMER_NAME,
+               C.EMAIL,
+               C.PHONE,
+               C.ADDRESS,
+               DECODE(C.CUSTOMER_TYPE, 'P', '개인고객', 'B', '기업고객') AS CUSTOMER_TYPE_NM,
+               FN_FORMAT_AMOUNT(C.CREDIT_LIMIT) AS CREDIT_LIMIT_FMT,
+               TO_CHAR(C.BIRTH_DATE, 'YYYY-MM-DD') AS BIRTH_DATE,
+               FN_CALC_AGE(C.BIRTH_DATE) AS AGE,
+               TRUNC(MONTHS_BETWEEN(SYSDATE, C.REG_DATE)) AS MEMBER_MONTHS,
+               TO_CHAR(C.REG_DATE, 'YYYY-MM-DD HH24:MI:SS') AS REG_DATE,
+               NVL(C.MEMO, '등급 미산정') AS GRADE_INFO,
+               NVL(ORD.ORDER_CNT, 0) AS ORDER_COUNT,
+               NVL(ORD.TOTAL_AMT, 0) AS TOTAL_PURCHASE,
+               FN_FORMAT_AMOUNT(NVL(ORD.TOTAL_AMT, 0)) AS TOTAL_PURCHASE_FMT
+        FROM CUSTOMERS C
+        LEFT JOIN (
+            SELECT CUSTOMER_ID,
+                   COUNT(*) AS ORDER_CNT,
+                   SUM(TOTAL_AMOUNT) AS TOTAL_AMT
+            FROM ORDERS
+            WHERE ORDER_STATUS != 'CANCELLED'
+            GROUP BY CUSTOMER_ID
+        ) ORD ON C.CUSTOMER_ID = ORD.CUSTOMER_ID
+        WHERE C.CUSTOMER_ID = #{customerId}
+    </select>
+
+    <!-- ========================================
+         SELECT: 시퀀스에서 다음 ID 가져오기
+         Oracle: DUAL, 시퀀스.NEXTVAL
+         ======================================== -->
+    <select id="getNextCustomerId" resultType="int">
+        SELECT SEQ_CUSTOMER.NEXTVAL FROM DUAL
+    </select>
+
+    <!-- ========================================
+         INSERT: 고객 등록
+         Oracle: SEQ.NEXTVAL, SYSDATE, SYSTIMESTAMP, NVL
+         ======================================== -->
+    <insert id="insertCustomer" parameterType="map">
+        INSERT INTO CUSTOMERS (
+            CUSTOMER_ID,
+            CUSTOMER_NAME,
+            EMAIL,
+            PHONE,
+            ADDRESS,
+            CUSTOMER_TYPE,
+            CREDIT_LIMIT,
+            BIRTH_DATE,
+            REG_DATE,
+            STATUS
+        ) VALUES (
+            SEQ_CUSTOMER.NEXTVAL,
+            #{customerName},
+            #{email},
+            #{phone},
+            #{address},
+            NVL(#{customerType}, 'P'),
+            NVL(#{creditLimit}, 0),
+            TO_DATE(#{birthDate}, 'YYYY-MM-DD'),
+            SYSTIMESTAMP,
+            'ACTIVE'
+        )
+    </insert>
+
+    <!-- ========================================
+         UPDATE: 고객 정보 수정
+         Oracle: NVL, SYSTIMESTAMP, CASE WHEN
+         ======================================== -->
+    <update id="updateCustomer" parameterType="map">
+        UPDATE CUSTOMERS
+        SET CUSTOMER_NAME = #{customerName},
+            EMAIL = #{email},
+            PHONE = #{phone},
+            ADDRESS = #{address},
+            CREDIT_LIMIT = NVL(#{creditLimit}, CREDIT_LIMIT),
+            BIRTH_DATE = CASE
+                WHEN #{birthDate} IS NOT NULL THEN TO_DATE(#{birthDate}, 'YYYY-MM-DD')
+                ELSE BIRTH_DATE
+            END,
+            UPD_DATE = SYSTIMESTAMP
+        WHERE CUSTOMER_ID = #{customerId}
+          AND STATUS = 'ACTIVE'
+    </update>
+
+    <!-- ========================================
+         UPDATE: 고객 비활성화
+         Oracle: SYSTIMESTAMP
+         ======================================== -->
+    <update id="deactivateCustomer" parameterType="int">
+        UPDATE CUSTOMERS
+        SET STATUS = 'INACTIVE',
+            UPD_DATE = SYSTIMESTAMP
+        WHERE CUSTOMER_ID = #{customerId}
+          AND STATUS = 'ACTIVE'
+          AND NOT EXISTS (
+              SELECT 1 FROM ORDERS
+              WHERE CUSTOMER_ID = #{customerId}
+                AND ORDER_STATUS IN ('PENDING', 'CONFIRMED', 'SHIPPED')
+          )
+    </update>
+
+    <!-- ========================================
+         DELETE: 고객 삭제 (소프트 삭제)
+         Oracle: SYSTIMESTAMP
+         ======================================== -->
+    <update id="deleteCustomer" parameterType="int">
+        UPDATE CUSTOMERS
+        SET STATUS = 'SUSPENDED',
+            MEMO = MEMO || CHR(10) || '[삭제] ' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI') || ' 삭제 처리',
+            UPD_DATE = SYSTIMESTAMP
+        WHERE CUSTOMER_ID = #{customerId}
+    </update>
+
+    <!-- ========================================
+         SELECT: 고객 통계
+         Oracle: DECODE, COUNT, SUM, NVL, GROUP BY, ROLLUP
+         ======================================== -->
+    <select id="selectCustomerStats" resultType="map">
+        SELECT NVL(DECODE(CUSTOMER_TYPE, 'P', '개인', 'B', '기업'), '합계') AS CUSTOMER_TYPE,
+               NVL(STATUS, '소계') AS STATUS,
+               COUNT(*) AS CNT,
+               SUM(NVL(CREDIT_LIMIT, 0)) AS TOTAL_CREDIT
+        FROM CUSTOMERS
+        GROUP BY ROLLUP(DECODE(CUSTOMER_TYPE, 'P', '개인', 'B', '기업'), STATUS)
+    </select>
+
+    <!-- ========================================
+         SELECT: 고객별 주문 목록 (LISTAGG)
+         Oracle: LISTAGG, WITHIN GROUP
+         ======================================== -->
+    <select id="selectCustomerOrderSummary" parameterType="int" resultType="map">
+        SELECT C.CUSTOMER_ID,
+               C.CUSTOMER_NAME,
+               COUNT(O.ORDER_ID) AS ORDER_COUNT,
+               FN_FORMAT_AMOUNT(SUM(O.TOTAL_AMOUNT)) AS TOTAL_PURCHASE,
+               LISTAGG(TO_CHAR(O.ORDER_ID), ', ') WITHIN GROUP (ORDER BY O.ORDER_DATE) AS ORDER_ID_LIST,
+               LISTAGG(TO_CHAR(O.ORDER_DATE, 'MM/DD'), ', ') WITHIN GROUP (ORDER BY O.ORDER_DATE) AS ORDER_DATE_LIST,
+               MIN(O.ORDER_DATE) AS FIRST_ORDER,
+               MAX(O.ORDER_DATE) AS LAST_ORDER,
+               ROUND(AVG(O.TOTAL_AMOUNT), 2) AS AVG_ORDER_AMT
+        FROM CUSTOMERS C
+        LEFT JOIN ORDERS O ON C.CUSTOMER_ID = O.CUSTOMER_ID
+            AND O.ORDER_STATUS != 'CANCELLED'
+        WHERE C.CUSTOMER_ID = #{customerId}
+        GROUP BY C.CUSTOMER_ID, C.CUSTOMER_NAME
+    </select>
+
+</mapper>
